@@ -1,0 +1,306 @@
+# Builds, tests and reviews a downstream release candidate.
+#
+# This workflow never publishes anything and never needs a publication credential. It produces the
+# exact binaries that release-publish.yaml later promotes, so the bytes that are tested here are
+# the bytes that ship: nothing is rebuilt between the two.
+#
+# Least privilege: every job declares `contents: read` and nothing else, except the review job,
+# which additionally needs to write a pull-request comment. No job references a registry token.
+name: release candidate
+
+on:
+  push:
+    branches:
+      - 'release/**'
+  pull_request:
+    branches:
+      - 'patched/**'
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain upstream's own builder image pins. Building inside a bookworm container puts a
+  # glibc 2.36 floor under the artifact, which is what the distroless runtime and the consumer's
+  # bookworm-slim runtime both provide. Building on the runner's own glibc would raise that floor
+  # and the binary would not run where it has to.
+  RUST_VERSION: '1.95.0'
+  BUILD_IMAGE: 'rust:1.95.0-bookworm'
+  UPSTREAM_BASE_IMAGE: 'ghcr.io/sebadob/rauthy:0.36.2'
+
+jobs:
+  assets:
+    name: frontend and wasm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack,just
+
+      - name: Build the wasm modules and the frontend
+        run: |
+          set -euxo pipefail
+          npm --prefix frontend ci
+          just build-wasm
+          just build-ui
+
+      # The generated assets are what gets embedded into the binary, so they are built once and
+      # handed to every build job. Rebuilding them per architecture would risk shipping two
+      # different frontends under one version.
+      - name: Package the generated assets
+        run: tar -czf generated-assets.tar.gz templates/html static/v1 frontend/src/wasm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: generated-assets
+          path: generated-assets.tar.gz
+          retention-days: 7
+
+  checks:
+    name: style and unit checks
+    runs-on: ubuntu-latest
+    needs: assets
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: generated-assets
+      - run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+      - run: tar -xzf generated-assets.tar.gz
+      - run: cargo fmt --all --check
+      # The same gate upstream's `just is-clean` uses. `--all-targets` would additionally lint
+      # upstream's own test code, which this release does not modify.
+      - run: cargo clippy --workspace -- -D warnings
+
+  tests:
+    name: integration suite (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    needs: assets
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [hiqlite, postgres]
+    services:
+      postgres:
+        image: postgres:17.2-alpine
+        env:
+          POSTGRES_USER: rauthy
+          POSTGRES_PASSWORD: 123SuperSafe
+          POSTGRES_DB: rauthy
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U rauthy" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: actions/download-artifact@v4
+        with:
+          name: generated-assets
+      - run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+      - run: tar -xzf generated-assets.tar.gz
+
+      # The recipes manage their own Postgres container, which the runner already provides here.
+      - name: Run the suite
+        run: |
+          set -euxo pipefail
+          cargo build
+          if [ "${{ matrix.backend }}" = "postgres" ]; then
+            export HIQLITE=false HQL_CACHE_STORAGE_DISK=false
+          fi
+          PUB_URL=localhost:8081 RP_ORIGIN=http://localhost:8081 \
+            ./target/debug/rauthy serve -c config-test.toml --test &
+          echo $! > .test_pid
+          for _ in $(seq 1 90); do
+            curl -sf localhost:8081/auth/v1/ping && break
+            sleep 1
+          done
+          cargo test
+          kill "$(cat .test_pid)"
+
+  build:
+    name: release binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: assets
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: generated-assets
+      - run: tar -xzf generated-assets.tar.gz
+
+      # jemalloc built with a 64K page size works on 4K and 64K kernels alike; the reverse is not
+      # true, so the aarch64 artifact is built the way upstream builds it.
+      - name: Build in a bookworm container
+        run: |
+          set -euxo pipefail
+          jemalloc_env=""
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            jemalloc_env="-e JEMALLOC_SYS_WITH_LG_PAGE=16"
+          fi
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e CARGO_TERM_COLOR=always \
+            $jemalloc_env \
+            "$BUILD_IMAGE" \
+            bash -euxc '
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential clang libpam0g-dev
+              cargo build --release --locked
+            '
+          mv target/release/rauthy "rauthy_${{ matrix.arch }}"
+          sha256sum "rauthy_${{ matrix.arch }}" > "rauthy_${{ matrix.arch }}.sha256"
+
+      - name: Record what the binary links against
+        run: |
+          set -euxo pipefail
+          file "rauthy_${{ matrix.arch }}"
+          # The highest glibc symbol version the artifact requires: the floor a runtime must meet.
+          objdump -T "rauthy_${{ matrix.arch }}" 2>/dev/null \
+            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -5 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rauthy-${{ matrix.arch }}
+          path: |
+            rauthy_${{ matrix.arch }}
+            rauthy_${{ matrix.arch }}.sha256
+          retention-days: 7
+
+  acceptance:
+    name: acceptance (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: build
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rauthy-${{ matrix.arch }}
+      - run: chmod +x "rauthy_${{ matrix.arch }}"
+
+      # The upstream release this build is based on, taken from its own published image, so the
+      # upgrade and rollback legs run against the real baseline rather than a rebuild of it.
+      - name: Extract the upstream baseline binary
+        run: |
+          set -euxo pipefail
+          docker pull "$UPSTREAM_BASE_IMAGE"
+          id="$(docker create "$UPSTREAM_BASE_IMAGE")"
+          docker cp "$id:/app/rauthy" ./rauthy_upstream
+          docker rm "$id" >/dev/null
+          chmod +x ./rauthy_upstream
+          ./rauthy_upstream --version
+
+      - name: Run the release acceptance
+        run: |
+          set -euo pipefail
+          ./assets/release/acceptance.sh "./rauthy_${{ matrix.arch }}" ./rauthy_upstream
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-${{ matrix.arch }}
+          path: /tmp/tmp.*/**/*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  review:
+    name: independent review
+    runs-on: ubuntu-latest
+    needs: [checks, tests]
+    # The review runs on trusted code only: `push` to a release branch and `workflow_dispatch` are
+    # both repository-owned. It is deliberately not wired to `pull_request_target`, which would
+    # expose the token to a fork's code. It holds no publication credential of any kind.
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify the review credential is present
+        env:
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "CLAUDE_CODE_OAUTH_TOKEN is not set; the review cannot run" >&2
+            exit 1
+          fi
+          echo "review credential present"
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Review the diff of this branch against the tag v0.36.2, which is the upstream release
+            it is based on: `git diff v0.36.2...HEAD`.
+
+            This is a downstream patched distribution of Rauthy, an identity provider. Report
+            concrete defects with a file and line, and say plainly when a concern does not hold.
+            Do not restate what the code does. Focus on, in order:
+
+            1. Authentication and authorization regressions. Anything that weakens MFA, TLS
+               verification, token validation, audience or scope enforcement, or admin-session
+               checks is the most serious finding available.
+            2. Error and readiness propagation out of the storage layer: whether a failure can
+               still reach a caller as a success, and whether `/ready` and `/health` can report
+               healthy while storage is not.
+            3. Storage ownership and shutdown: whether any exit path after the storage layer
+               starts can skip its shutdown, and whether a second process could touch a data
+               directory another process owns.
+            4. Backup, restore and upgrade safety: truncation, partial writes, destroying the last
+               recoverable state, and the version stamped into the database locking out a
+               rollback to upstream v0.36.2.
+            5. Dependency and package provenance: whether anything resolves to an unexpected
+               source.
+            6. Workflow permissions and publication correctness: over-broad `permissions`, a
+               credential reachable from untrusted code, or a publication destination that is not
+               under the bartekus namespace.

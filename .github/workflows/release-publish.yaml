@@ -1,0 +1,175 @@
+# Promotes an already tested release candidate.
+#
+# This workflow builds no code. It takes the exact binaries a release-candidate run produced,
+# packages them into the image, pushes that image, and creates the GitHub release from the same
+# bytes. Rebuilding here would publish something no acceptance run ever saw.
+name: release publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: 'Run id of the release-candidate workflow whose artifacts to promote'
+        required: true
+      version:
+        description: 'The version to publish, e.g. 0.36.2-patched.1. Must match Cargo.toml.'
+        required: true
+
+permissions: {}
+
+env:
+  IMAGE: ghcr.io/bartekus/rauthy-patched
+
+jobs:
+  publish:
+    name: publish image and release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The version being published must be the version in the tree
+        run: |
+          set -euo pipefail
+          in_tree="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$in_tree" != "${{ inputs.version }}" ]; then
+            echo "Cargo.toml declares $in_tree, the run asks to publish ${{ inputs.version }}" >&2
+            exit 1
+          fi
+          echo "version=$in_tree" >> "$GITHUB_ENV"
+          echo "upstream_base=$(grep -m1 'RAUTHY_UPSTREAM_BASE: &str' src/common/src/constants.rs \
+            | cut -d'"' -f2)" >> "$GITHUB_ENV"
+          echo "upstream_commit=$(grep -m1 'RAUTHY_UPSTREAM_COMMIT: &str' \
+            src/common/src/constants.rs | cut -d'"' -f2)" >> "$GITHUB_ENV"
+
+      # A published tag is immutable. Moving one would change what a consumer's digest pin means
+      # relative to the tag they wrote down, so a tag that already exists stops the run.
+      - name: Refuse to move a published tag
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "$IMAGE:$version" > /dev/null 2>&1; then
+            echo "$IMAGE:$version is already published; pick a new patch level" >&2
+            exit 1
+          fi
+          echo "$IMAGE:$version is free"
+
+      - name: Fetch the tested binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rauthy-*
+          merge-multiple: true
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify the binaries are the ones that were tested
+        run: |
+          set -euxo pipefail
+          sha256sum -c rauthy_amd64.sha256
+          sha256sum -c rauthy_arm64.sha256
+          mkdir -p out/empty
+          cp rauthy_amd64 rauthy_arm64 out/
+          chmod +x out/rauthy_amd64 out/rauthy_arm64
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push the multi-architecture image
+        id: push
+        run: |
+          set -euxo pipefail
+          docker buildx build \
+            --build-arg CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg VERSION="$version" \
+            --build-arg REVISION="${{ github.sha }}" \
+            --build-arg UPSTREAM_BASE="$upstream_base" \
+            --build-arg UPSTREAM_COMMIT="$upstream_commit" \
+            --platform linux/amd64,linux/arm64 \
+            --provenance=true --sbom=true \
+            -t "$IMAGE:$version" \
+            --push .
+
+          index_digest="$(docker buildx imagetools inspect "$IMAGE:$version" \
+            --format '{{println .Manifest.Digest}}' | head -1)"
+          echo "index_digest=$index_digest" >> "$GITHUB_ENV"
+          echo "index_digest=$index_digest" >> "$GITHUB_OUTPUT"
+
+          docker buildx imagetools inspect "$IMAGE@$index_digest" > image-index.txt
+          cat image-index.txt
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.index_digest }}
+          push-to-registry: true
+
+      - name: Verify the published image before announcing it
+        run: |
+          set -euxo pipefail
+          # Pull by digest, not by tag: this proves the digest recorded above is the one that
+          # carries the bytes, and it is the form the consumer pins.
+          docker pull "$IMAGE@$index_digest"
+          for arch in amd64 arm64; do
+            id="$(docker create --platform "linux/$arch" "$IMAGE@$index_digest")"
+            docker cp "$id:/app/rauthy" "./pulled_$arch"
+            docker rm "$id" > /dev/null
+            # The image must carry the very bytes that were tested.
+            diff <(sha256sum < "./pulled_$arch") <(sha256sum < "rauthy_$arch") \
+              || { echo "the $arch image does not carry the tested binary" >&2; exit 1; }
+          done
+          # The runner is amd64, so only that one can be executed here.
+          chmod +x ./pulled_amd64
+          ./pulled_amd64 --version | grep -q "$version"
+
+      - name: Collect the checksums
+        run: |
+          set -euxo pipefail
+          sha256sum rauthy_amd64 rauthy_arm64 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          {
+            echo "Downstream patched build of Rauthy. **Not an upstream release** and not endorsed"
+            echo "by or supported by the upstream project."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream base | \`$upstream_base\` (\`$upstream_commit\`) |"
+            echo "| Source commit | \`${{ github.sha }}\` |"
+            echo "| Image | \`$IMAGE:$version\` |"
+            echo "| Image index digest | \`$index_digest\` |"
+            echo
+            echo "Pin by digest:"
+            echo
+            echo '```'
+            echo "$IMAGE:$version@$index_digest"
+            echo '```'
+            echo
+            echo "Per-platform manifests and the binary checksums are attached. See"
+            echo "\`RELEASE-LEDGER.md\` in this tag for the full ledger and the consumer handoff."
+          } > notes.md
+
+          git tag -f "v$version" "${{ github.sha }}"
+          git push origin "v$version"
+          gh release create "v$version" \
+            --title "Rauthy v$version (downstream patched)" \
+            --notes-file notes.md \
+            rauthy_amd64 rauthy_arm64 SHA256SUMS image-index.txt
+
+      - name: Report what remains
+        run: |
+          echo "Published $IMAGE:$version@$index_digest"
+          echo "If the GHCR package is private, its visibility is an owner UI action:"
+          echo "  https://github.com/users/bartekus/packages/container/rauthy-patched/settings"

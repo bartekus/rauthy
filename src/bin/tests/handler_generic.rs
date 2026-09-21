@@ -94,3 +94,102 @@ async fn test_get_well_known_oauth_rfc8414() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_get_ready_and_health() -> Result<(), Box<dyn Error>> {
+    // `/ready` is the orchestrator's probe. On a backend whose storage is up it must answer 200;
+    // the 503 leg is covered by the unit test over the health watcher's verdict, because this
+    // suite has no way to take the storage layer down under a running backend.
+    let res = reqwest::get(format!("{}/ready", get_backend_url())).await?;
+    assert_eq!(res.status(), 200);
+
+    let res = reqwest::get(format!("{}/health", get_backend_url())).await?;
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await?;
+    assert_eq!(body["db_healthy"], serde_json::Value::Bool(true));
+    assert_eq!(body["cache_healthy"], serde_json::Value::Bool(true));
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupListing {
+    name: String,
+    size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupListings {
+    local: Vec<BackupListing>,
+}
+
+/// The backup download must hand over the whole file, or fail.
+///
+/// A consumer takes a backup and downloads it in one go, and it has nothing but the status code
+/// and the listing to check the result against. The download used to end the body on a read error
+/// exactly as it ended it on EOF, so a short file arrived under a 200. Comparing the downloaded
+/// length against the listed size is the end-to-end form of that check; `pump_reader`'s own tests
+/// cover the failing-read path directly.
+#[tokio::test]
+async fn test_backup_download_is_complete() -> Result<(), Box<dyn Error>> {
+    if std::env::var("HIQLITE").as_deref() == Ok("false") {
+        // The backup routes exist only for the Hiqlite backend; with Postgres they answer 404 by
+        // design. The Postgres leg of this suite therefore has nothing to assert here.
+        return Ok(());
+    }
+
+    let (headers, _) = common::session_headers().await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/backup", get_backend_url());
+
+    // Consumers trigger a fresh backup and then take the newest one. Repeated rapid requests are
+    // part of that usage, so they must not fail or race into a half-written file.
+    for _ in 0..3 {
+        let res = client.post(&url).headers(headers.clone()).send().await?;
+        assert!(
+            res.status().is_success(),
+            "a backup trigger must succeed, got {}",
+            res.status()
+        );
+    }
+
+    let listings: BackupListings = client
+        .get(&url)
+        .headers(headers.clone())
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        !listings.local.is_empty(),
+        "the triggered backups must be listed"
+    );
+
+    for listing in &listings.local {
+        let res = client
+            .get(format!(
+                "{}/backup/local/{}",
+                get_backend_url(),
+                listing.name
+            ))
+            .headers(headers.clone())
+            .send()
+            .await?;
+        assert_eq!(res.status(), 200);
+        let bytes = res.bytes().await?;
+
+        assert_eq!(
+            bytes.len() as u64,
+            listing.size,
+            "the download of {} is short: a truncated backup must never arrive under a 200",
+            listing.name
+        );
+        assert!(
+            bytes.starts_with(b"SQLite format 3\0"),
+            "{} is not a SQLite database",
+            listing.name
+        );
+    }
+
+    Ok(())
+}

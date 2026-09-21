@@ -7,7 +7,7 @@ use crate::secrets::RauthySecrets;
 use crate::vault_config::VaultConfig;
 use cryptr::EncKeys;
 use hiqlite::NodeConfig;
-use rauthy_common::constants::CookieMode;
+use rauthy_common::constants::{CookieMode, DEFAULT_CONFIG_PATH};
 use rauthy_common::logging::LogLevelAccess;
 use rauthy_common::regex::{RE_LINUX_USERNAME, RE_PREFERRED_USERNAME};
 use regex::Regex;
@@ -15,6 +15,7 @@ use serde::Serialize;
 use spow::pow::Pow;
 use std::borrow::Cow;
 use std::error::Error;
+use std::io;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::{env, mem};
@@ -1105,9 +1106,24 @@ impl Vars {
             },
             _ => match fs::read_to_string(path_config).await {
                 Ok(s) => s,
-                Err(err) => {
-                    warn!("Cannot read config from {}: {:?}", path_config, err);
+                // A deployment may be configured entirely through environment variables, so the
+                // *default* config file simply not being there is a supported setup and stays a
+                // warning. Anything else is an operator error that must not be swallowed: a path
+                // that was named explicitly, or a file that exists but cannot be read. Continuing
+                // with an empty config there reports the first missing value instead of the real
+                // problem, which sends the operator looking in the wrong place.
+                Err(err)
+                    if err.kind() == io::ErrorKind::NotFound
+                        && path_config == DEFAULT_CONFIG_PATH =>
+                {
+                    warn!(
+                        "No config file at the default path {path_config}, \
+                        continuing with environment variables only"
+                    );
                     String::default()
+                }
+                Err(err) => {
+                    panic!("Cannot read the config file {path_config}: {err}");
                 }
             },
         };

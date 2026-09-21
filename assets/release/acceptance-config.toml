@@ -1,0 +1,41 @@
+# Config for the release acceptance run. Single node, Hiqlite, plain HTTP on loopback.
+# Ports and the data directory are overridden per scenario through env vars.
+
+[cluster]
+node_id = 1
+# Fire the auto-backup every minute so the restore scenarios have a real backup to work from.
+backup_cron = '0 * * * * * *'
+nodes = ["1 localhost:8100 localhost:8200"]
+secret_raft = "AcceptanceRaftSecret1337xyz"
+secret_api = "AcceptanceApiSecret1337xyz"
+
+[database]
+health_check_delay_secs = 0
+
+[encryption]
+keys = ['bVCyTsGaggVy5yqQ/UzluN29DZW41M3hTSkx6Y3NtZmRuQkR2TnJxUTYzcjQ=']
+key_active = 'bVCyTsGaggVy5yqQ'
+
+[email]
+rauthy_admin_email = 'admin@localhost'
+
+[hashing]
+argon2_m_cost = 32768
+argon2_t_cost = 1
+argon2_p_cost = 2
+max_hash_threads = 1
+
+[logging]
+level = 'info'
+
+[mfa]
+admin_force_mfa = false
+
+[server]
+scheme = 'http'
+http_workers = 1
+
+[webauthn]
+rp_id = 'localhost'
+rp_origin = 'http://localhost:8091'
+rp_name = 'Rauthy Acceptance'

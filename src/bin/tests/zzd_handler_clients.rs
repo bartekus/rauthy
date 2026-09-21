@@ -115,7 +115,13 @@ async fn test_clients() -> Result<(), Box<dyn Error>> {
     assert_eq!(res.status(), 200);
 
     let clients = res.json::<Vec<ClientResponse>>().await?;
-    let len_orig = clients.len();
+    // The ids that existed before this test ran. A raw count would be wrong: the other tests in
+    // this binary run concurrently and create and delete clients of their own, so the total moves
+    // under this test through no fault of its own.
+    let ids_orig = clients
+        .iter()
+        .map(|c| c.id.clone())
+        .collect::<std::collections::HashSet<_>>();
     let client = clients.iter().find(|c| c.id == "rauthy").unwrap();
     println!("{:?}", client);
     assert_eq!(client.id, "rauthy");
@@ -295,7 +301,19 @@ async fn test_clients() -> Result<(), Box<dyn Error>> {
     assert_eq!(res.status(), 200);
 
     let clients = res.json::<Vec<ClientResponse>>().await?;
-    assert_eq!(clients.len(), len_orig);
+    let ids_now = clients
+        .iter()
+        .map(|c| c.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        !ids_now.contains("test123"),
+        "the client this test created must be gone"
+    );
+    assert!(
+        ids_orig.is_subset(&ids_now),
+        "this test must not have removed a client it did not create: {:?}",
+        ids_orig.difference(&ids_now).collect::<Vec<_>>()
+    );
 
     Ok(())
 }

@@ -1,14 +1,14 @@
 use crate::database::DB;
 use crate::entity::config::ConfigEntity;
 use hiqlite::macros::params;
-use rauthy_common::constants::RAUTHY_VERSION;
+use rauthy_common::constants::{RAUTHY_UPSTREAM_BASE, RAUTHY_VERSION};
 use rauthy_common::is_hiqlite;
 use rauthy_common::utils::{deserialize, serialize};
 use rauthy_error::ErrorResponse;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // TODO After bumping to v0.37, make sure the lowest compatible is set to v0.36
 //  and `apply_temp_migrations()` was cleaned up!
@@ -108,12 +108,24 @@ ON CONFLICT(id) DO UPDATE SET data = $1"#;
             );
         }
 
-        // warn on prerelease usage
-        if !app_version.pre.is_empty() {
-            warn!(
-                "!!! Caution: you are using a pre-release version: {} - DO NOT USE IN PRODUCTION !!!",
-                app_version.pre.as_str()
-            );
+        // A downstream patched build carries its distribution marker in the SemVer pre-release
+        // field, because that is the only place a valid SemVer can hold it and still parse and
+        // order. It is not an upstream pre-release, so it does not get the pre-release warning;
+        // anything else in that field still does.
+        match downstream_patch_level(app_version) {
+            Some(level) => {
+                info!(
+                    "Downstream patched build {level} of upstream Rauthy {RAUTHY_UPSTREAM_BASE}. \
+                    This is not an upstream release.",
+                );
+            }
+            None if !app_version.pre.is_empty() => {
+                warn!(
+                    "!!! Caution: you are using a pre-release version: {} - DO NOT USE IN PRODUCTION !!!",
+                    app_version.pre.as_str()
+                );
+            }
+            None => {}
         }
 
         // check for the lowest DB version we can use with this App Version
@@ -188,5 +200,53 @@ ON CONFLICT(id) DO UPDATE SET data = $1"#;
 impl DbVersion {
     pub fn app_version() -> Version {
         Version::from_str(RAUTHY_VERSION).expect("bad format for RAUTHY_VERSION")
+    }
+}
+
+/// The patch level of a downstream build, if this version is one.
+///
+/// The marker is `patched.<n>` in the SemVer pre-release field, so `0.36.2-patched.1` is the first
+/// patched build of upstream `0.36.2`. Anything else in that field is a real pre-release.
+fn downstream_patch_level(version: &Version) -> Option<u32> {
+    version.pre.as_str().strip_prefix("patched.")?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shipped_version_parses_and_is_recognised_as_a_downstream_build() {
+        let v = DbVersion::app_version();
+        assert_eq!((v.major, v.minor), (0, 36), "the guard below keys on this");
+        assert_eq!(
+            downstream_patch_level(&v),
+            Some(1),
+            "RAUTHY_VERSION {RAUTHY_VERSION} must carry the downstream marker, or the release \
+            would log an upstream pre-release warning"
+        );
+    }
+
+    #[test]
+    fn a_real_prerelease_is_not_mistaken_for_a_downstream_build() {
+        for raw in ["0.37.0-20260917", "0.36.2-rc.1", "0.36.2", "0.36.2-patched"] {
+            assert_eq!(
+                downstream_patch_level(&Version::parse(raw).unwrap()),
+                None,
+                "{raw} must keep the upstream pre-release handling"
+            );
+        }
+    }
+
+    /// An operator who rolls back to the upstream release this was built from must not be locked
+    /// out by the version this build wrote into the `config` table.
+    #[test]
+    fn the_version_written_to_the_db_does_not_lock_out_the_upstream_base() {
+        let written = DbVersion::app_version();
+        let lowest = Version::parse(LOWEST_COMPATIBLE_VERSION).unwrap();
+        assert!(
+            written >= lowest,
+            "upstream {RAUTHY_UPSTREAM_BASE} would refuse a database stamped {written}"
+        );
     }
 }

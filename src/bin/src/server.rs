@@ -5,16 +5,22 @@ use actix_web::{App, HttpServer, middleware, web};
 use actix_web_prom::PrometheusMetricsBuilder;
 use prometheus::Registry;
 use rauthy_common::constants::BUILD_TIME;
-use rauthy_common::constants::RAUTHY_VERSION;
+use rauthy_common::constants::{
+    RAUTHY_DISTRIBUTOR, RAUTHY_SOURCE_URL, RAUTHY_UPSTREAM_BASE, RAUTHY_UPSTREAM_COMMIT,
+    RAUTHY_VERSION,
+};
 use rauthy_common::utils::UseDummyAddress;
 use rauthy_common::{is_hiqlite, password_hasher};
 use rauthy_data::ListenScheme;
 use rauthy_data::database::{Cache, DB};
 use rauthy_data::email::mailer;
+use rauthy_data::email::mailer::EMail;
 use rauthy_data::entity;
 use rauthy_data::entity::pictures::UserPicture;
+use rauthy_data::events::event::Event;
 use rauthy_data::events::health_watch::watch_health;
 use rauthy_data::events::listener::EventListener;
+use rauthy_data::events::listener::EventRouterMsg;
 use rauthy_data::events::notifier::EventNotifier;
 use rauthy_data::rauthy_config::RauthyConfig;
 use rauthy_handlers::openapi::ApiDoc;
@@ -82,6 +88,11 @@ pub async fn run(
 
     let log_level = setup_logging();
     info!("Starting Rauthy v{RAUTHY_VERSION} ({})", *BUILD_TIME);
+    info!(
+        "Downstream distribution by '{RAUTHY_DISTRIBUTOR}' from upstream {RAUTHY_UPSTREAM_BASE} \
+        ({}), source {RAUTHY_SOURCE_URL} - not an upstream release",
+        &RAUTHY_UPSTREAM_COMMIT[..12]
+    );
     info!("Log Level set to '{log_level}'");
     if test_mode {
         warn!("Application started in Integration Test Mode");
@@ -97,8 +108,43 @@ pub async fn run(
 
     DB::init(node_config)
         .await
-        .expect("Error starting the database / cache layer");
+        .map_err(|err| format!("Cannot start the database / cache layer: {err}"))?;
 
+    // From here on the storage layer is live and owns this data directory. Every exit path,
+    // successful or not, must go through the shutdown below. Returning early instead would leave
+    // the WAL lock held until the process dies and the state-machine lock file in place, and the
+    // next start would then read the data directory as an unclean shutdown and rebuild the state
+    // machine from the Raft log. `serve()` therefore returns its error rather than propagating it.
+    let served = serve(
+        tx_email,
+        tx_events_router,
+        rx_events_router,
+        rx_events,
+        rx_email,
+    )
+    .await;
+
+    if let Err(err) = DB::hql().shutdown().await {
+        error!("Error shutting down the database / cache layer: {err}");
+        // Only surface it if nothing worse already happened.
+        served?;
+        return Err(err.into());
+    }
+
+    served
+}
+
+/// Everything that runs while the storage layer is live.
+///
+/// Split out of [`run`] so that a single call site owns the Hiqlite shutdown: see the comment
+/// there for why an early `?` in this body would be a data-directory hazard.
+async fn serve(
+    tx_email: mpsc::Sender<EMail>,
+    tx_events_router: flume::Sender<EventRouterMsg>,
+    rx_events_router: flume::Receiver<EventRouterMsg>,
+    rx_events: flume::Receiver<Event>,
+    rx_email: mpsc::Receiver<EMail>,
+) -> Result<(), Box<dyn Error>> {
     debug!("Starting E-Mail handler");
     tokio::spawn(mailer::sender(rx_email));
 
@@ -107,10 +153,14 @@ pub async fn run(
     tokio::spawn(password_hasher::run());
 
     debug!("Applying database migrations");
-    DB::migrate().await.expect("Database migration error");
+    DB::migrate()
+        .await
+        .map_err(|err| format!("Database migration error: {err}"))?;
 
     debug!("Starting Events handler");
-    EventNotifier::init_notifiers(tx_email).await.unwrap();
+    EventNotifier::init_notifiers(tx_email)
+        .await
+        .map_err(|err| format!("Cannot initialize event notifiers: {err}"))?;
     tokio::spawn(EventListener::listen(
         tx_events_router,
         rx_events_router,
@@ -126,7 +176,9 @@ pub async fn run(
         time::sleep(Duration::from_secs(1)).await;
     }
 
-    UserPicture::test_config().await.unwrap();
+    UserPicture::test_config()
+        .await
+        .map_err(|err| format!("Invalid user picture configuration: {err}"))?;
 
     // We need to clear some caches
     DB::hql().clear_cache(Cache::Html).await?;
@@ -165,10 +217,7 @@ pub async fn run(
     if RauthyConfig::get().vars.atproto.enable {
         entity::atproto::Client::init_provider()
             .await
-            .map_err(|error| {
-                error!(%error, "failed to initialize atproto provider");
-            })
-            .unwrap();
+            .map_err(|error| format!("Cannot initialize the atproto provider: {error}"))?;
     }
 
     rauthy_schedulers::spawn();
@@ -178,8 +227,6 @@ pub async fn run(
     } else {
         server_without_metrics().await?;
     }
-
-    DB::hql().shutdown().await?;
 
     Ok(())
 }

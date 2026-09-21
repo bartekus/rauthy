@@ -8,13 +8,13 @@
 # which additionally needs to write a pull-request comment. No job references a registry token.
 name: release candidate
 
+# Only `push` to a release branch and a manual dispatch. A `pull_request` trigger would run the
+# whole matrix a second time on the same commit; a pull request onto a release line shows the
+# checks from the push run, because GitHub attaches them to the commit.
 on:
   push:
     branches:
       - 'release/**'
-  pull_request:
-    branches:
-      - 'patched/**'
   workflow_dispatch:
 
 permissions: {}
@@ -259,7 +259,6 @@ jobs:
     # The review runs on trusted code only: `push` to a release branch and `workflow_dispatch` are
     # both repository-owned. It is deliberately not wired to `pull_request_target`, which would
     # expose the token to a fork's code. It holds no publication credential of any kind.
-    if: github.event_name != 'pull_request'
     permissions:
       contents: read
       pull-requests: write

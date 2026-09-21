@@ -176,11 +176,27 @@ hiqlite = { package = "hiqlite-patched", version = "<selected>", features = [
 ```
 
 with the matching `package` aliases for `hiqlite-wal` and `hiqlite-derive` where they appear as
-direct dependencies. The alias keeps every `use hiqlite::...` in the tree working unchanged, which
-is why no import in `src/` has to move. After the swap:
+direct dependencies inside the patched `hiqlite` package itself.
 
-1. `cargo tree -i hiqlite-patched` and `cargo metadata` must show the patched packages selected for
-   every storage path, with no second upstream copy in the graph.
+**The alias mechanism was verified, provisionally.** In an isolated scratch checkout, the repaired
+Hiqlite tree was renamed to the three `-patched` package names, its internal dependencies aliased
+back, and this candidate pointed at it through `hiqlite = { package = "hiqlite-patched", ... }`:
+
+- `cargo check --workspace --all-targets` compiles clean with **no source change**. Not one `use
+  hiqlite::...` has to move, and the derive macros keep resolving, because the alias restores the
+  name `hiqlite` inside the consuming crate, which is what the generated `::hiqlite` paths need.
+- `cargo tree` and `cargo metadata` resolve exactly three packages matching `hiqlite*`:
+  `hiqlite-patched`, `hiqlite-wal-patched` and `hiqlite-derive-patched`. No upstream `hiqlite`
+  copy survives anywhere in the graph.
+
+That result is **provisional**: it used a local path to a rename of the repaired tree, not the
+published packages, and the published versions and their contents may differ. It de-risks the
+mechanism; it does not qualify a release.
+
+After the real swap:
+
+1. `cargo tree -i hiqlite-patched` and `cargo metadata` must again show the patched packages
+   selected for every storage path, with no second upstream copy in the graph.
 2. Re-run the full candidate workflow. The dependency changed, so every earlier result is void.
 3. Publish from the run that tested the new graph.
 

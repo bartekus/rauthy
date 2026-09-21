@@ -1209,3 +1209,190 @@ async fn test_dcr_rejects_unsupported_grant() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+/// RFC 8628, end to end, against a client configured for it.
+///
+/// The consumer drives this flow for its native clients, and rauthy's own suite did not cover it:
+/// the well-known document advertises the endpoint and nothing exercised it. The legs that matter
+/// to a caller are all here, including the two negative ones: a poll before the person has
+/// approved must say `authorization_pending` rather than issue a token, and an unknown device code
+/// must be refused.
+#[tokio::test]
+async fn test_device_code_flow() -> Result<(), Box<dyn Error>> {
+    let backend_url = get_backend_url();
+    let auth_headers = get_auth_headers().await?;
+    let client = reqwest::Client::new();
+    let device_client_id = "device_grant_test";
+
+    // A client with the device grant enabled. `init_client` does not have it, and enabling it
+    // there would change what the other tests in this binary see.
+    let new_client = rauthy_api_types::clients::NewClientRequest {
+        id: device_client_id.to_string(),
+        secret: None,
+        name: Some("Device Grant Test".to_string()),
+        confidential: false,
+        redirect_uris: vec!["http://localhost:8081/callback".to_string()],
+        post_logout_redirect_uris: None,
+    };
+    let res = client
+        .post(format!("{backend_url}/clients"))
+        .headers(auth_headers.clone())
+        .json(&new_client)
+        .send()
+        .await?;
+    assert_eq!(res.status(), 200);
+    let created = res
+        .json::<rauthy_api_types::clients::ClientResponse>()
+        .await?;
+
+    let update = UpdateClientRequest {
+        name: created.name.clone(),
+        confidential: false,
+        redirect_uris: created.redirect_uris.clone(),
+        post_logout_redirect_uris: None,
+        allowed_origins: None,
+        enabled: true,
+        flows_enabled: vec![GrantType::DeviceCode, GrantType::RefreshToken],
+        access_token_alg: JwkKeyPairAlg::EdDSA,
+        id_token_alg: JwkKeyPairAlg::EdDSA,
+        auth_code_lifetime: 60,
+        access_token_lifetime: 300,
+        scopes: vec!["openid".to_string(), "email".to_string()],
+        default_scopes: vec!["openid".to_string()],
+        challenges: Some(vec!["S256".to_string()]),
+        force_mfa: false,
+        client_uri: None,
+        contacts: None,
+        backchannel_logout_uri: None,
+        restrict_group_prefix: None,
+        claims: None,
+        claims_at_root: false,
+        allowed_resources: None,
+        default_aud: None,
+        scim: None,
+    };
+    let res = client
+        .put(format!("{backend_url}/clients/{device_client_id}"))
+        .headers(auth_headers.clone())
+        .json(&update)
+        .send()
+        .await?;
+    assert_eq!(res.status(), 200);
+
+    // The client's leg: ask for a device code and the code the person types in.
+    let res = client
+        .post(format!("{backend_url}/oidc/device"))
+        .form(&[("client_id", device_client_id), ("scope", "openid email")])
+        .send()
+        .await?;
+    assert_eq!(res.status(), 200, "the device grant must be accepted");
+    let granted = res.json::<serde_json::Value>().await?;
+    let device_code = granted["device_code"]
+        .as_str()
+        .expect("device_code")
+        .to_string();
+    let user_code = granted["user_code"]
+        .as_str()
+        .expect("user_code")
+        .to_string();
+    assert!(granted["verification_uri"].as_str().is_some());
+    assert!(granted["expires_in"].as_u64().is_some());
+    // rauthy answers `slow_down` to a client that polls faster than this, so the test has to be a
+    // well-behaved client for its answers to mean anything.
+    let interval = Duration::from_secs(granted["interval"].as_u64().unwrap_or(5) + 1);
+
+    // Negative: polling before anyone has approved must not hand over a token.
+    time::sleep(interval).await;
+    let res = client
+        .post(format!("{backend_url}/oidc/token"))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code.as_str()),
+            ("client_id", device_client_id),
+        ])
+        .send()
+        .await?;
+    assert!(
+        !res.status().is_success(),
+        "an unapproved device code must not yield a token set"
+    );
+    let body = res.text().await?;
+    assert!(
+        body.contains("authorization_pending"),
+        "the poll must say why it is not ready yet: {body}"
+    );
+
+    // Negative: a device code nobody issued must be refused.
+    time::sleep(interval).await;
+    let res = client
+        .post(format!("{backend_url}/oidc/token"))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", "aDeviceCodeThatWasNeverIssued"),
+            ("client_id", device_client_id),
+        ])
+        .send()
+        .await?;
+    assert!(!res.status().is_success());
+    let body = res.text().await?;
+    assert!(
+        !body.contains("authorization_pending") && !body.contains("slow_down"),
+        "an unknown device code must be refused outright, not reported as pending or \
+        rate limited: {body}"
+    );
+
+    // The person's leg: an authenticated session approves the user code.
+    let (session_headers, _) = common::session_headers().await;
+    let res = client
+        .post(format!("{backend_url}/oidc/device/verify"))
+        .headers(session_headers)
+        .json(&serde_json::json!({
+            "user_code": user_code,
+            "pow": get_solved_pow().await,
+            "device_accepted": "accept",
+        }))
+        .send()
+        .await?;
+    let status = res.status();
+    assert!(
+        status.is_success(),
+        "the approval must succeed, got {status}: {}",
+        res.text().await.unwrap_or_default()
+    );
+
+    // The client's poll, now that the approval has landed.
+    let mut token_set: Option<TokenSet> = None;
+    for _ in 0..20 {
+        time::sleep(interval).await;
+        let res = client
+            .post(format!("{backend_url}/oidc/token"))
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", device_code.as_str()),
+                ("client_id", device_client_id),
+            ])
+            .send()
+            .await?;
+        if res.status().is_success() {
+            token_set = Some(res.json::<TokenSet>().await?);
+            break;
+        }
+        let body = res.text().await?;
+        assert!(
+            body.contains("authorization_pending") || body.contains("slow_down"),
+            "the poll after approval must not fail outright: {body}"
+        );
+    }
+
+    let ts = token_set.expect("an approved device code must yield a token set");
+    assert!(!ts.access_token.is_empty());
+    assert!(ts.refresh_token.is_some(), "the refresh grant was enabled");
+
+    client
+        .delete(format!("{backend_url}/clients/{device_client_id}"))
+        .headers(auth_headers)
+        .send()
+        .await?;
+
+    Ok(())
+}

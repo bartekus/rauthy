@@ -29,6 +29,8 @@ jobs:
       packages: write
       attestations: write
       id-token: write
+      # Downloading artifacts from another workflow run needs this; nothing else does.
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
@@ -46,8 +48,17 @@ jobs:
           echo "upstream_commit=$(grep -m1 'RAUTHY_UPSTREAM_COMMIT: &str' \
             src/common/src/constants.rs | cut -d'"' -f2)" >> "$GITHUB_ENV"
 
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
       # A published tag is immutable. Moving one would change what a consumer's digest pin means
-      # relative to the tag they wrote down, so a tag that already exists stops the run.
+      # relative to the tag they wrote down, so a tag that already exists stops the run. The
+      # registry login above has to come first, or a private package would look absent.
       - name: Refuse to move a published tag
         run: |
           set -euo pipefail
@@ -74,14 +85,6 @@ jobs:
           cp rauthy_amd64 rauthy_arm64 out/
           chmod +x out/rauthy_amd64 out/rauthy_arm64
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
       - name: Build and push the multi-architecture image
         id: push
         run: |
@@ -95,10 +98,13 @@ jobs:
             --platform linux/amd64,linux/arm64 \
             --provenance=true --sbom=true \
             -t "$IMAGE:$version" \
+            --metadata-file buildx-metadata.json \
             --push .
 
-          index_digest="$(docker buildx imagetools inspect "$IMAGE:$version" \
-            --format '{{println .Manifest.Digest}}' | head -1)"
+          # buildx reports the digest of what it pushed; parsing an inspect template would be
+          # a second, weaker source for the same fact.
+          index_digest="$(python3 -c \
+            'import json;print(json.load(open("buildx-metadata.json"))["containerimage.digest"])')"
           echo "index_digest=$index_digest" >> "$GITHUB_ENV"
           echo "index_digest=$index_digest" >> "$GITHUB_OUTPUT"
 
@@ -161,9 +167,12 @@ jobs:
             echo "\`RELEASE-LEDGER.md\` in this tag for the full ledger and the consumer handoff."
           } > notes.md
 
-          git tag -f "v$version" "${{ github.sha }}"
-          git push origin "v$version"
+          if gh release view "v$version" > /dev/null 2>&1; then
+            echo "release v$version already exists; published releases are never replaced" >&2
+            exit 1
+          fi
           gh release create "v$version" \
+            --target "${{ github.sha }}" \
             --title "Rauthy v$version (downstream patched)" \
             --notes-file notes.md \
             rauthy_amd64 rauthy_arm64 SHA256SUMS image-index.txt

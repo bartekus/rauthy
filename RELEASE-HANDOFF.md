@@ -100,6 +100,13 @@ The build stamps `0.36.2-patched.1` into the `config` table's `db_version` row.
   left intact.
 - **Rollback.** Upstream `ghcr.io/sebadob/rauthy:0.36.2` starts again on a data directory this
   build has written. Nothing below `v0.36.2` is supported.
+- **The ownership lock is not the consumer's to move, and it is not moved.** Checked while tracing
+  this: `rahi`'s restore probes `rauthy/state_machine/lock` for existence and nothing else, and
+  the paths it resets (`APP_RESET_PATHS`) are its own node's, not rauthy's. Worth knowing that this
+  file is an existence marker rather than an OS lock, so it survives an ungraceful exit: a restore
+  gated on it refuses after a crash as well as while rauthy runs. That is the conservative
+  direction, so no change was made anywhere. The real ownership lock, the one that stops a second
+  process, is the `flock` on `logs/lock.hql`.
 - **Not supported.** Running this build and any other Rauthy version in one raft cluster.
 
 ## Test results
@@ -135,6 +142,11 @@ is stamped from the wall clock).
 3. `/auth/v1/ready` answers `503` when storage is confirmed unreachable.
 4. An unreadable config file fails the start and names itself.
 5. A shared-state defect in upstream's own client handler test.
+
+And one coverage gap closed without a product change: the device grant (RFC 8628) had no test in
+rauthy's own suite, although `rahi` drives it for native clients. `test_device_code_flow` now
+covers it end to end on both backends, including a poll before approval and an unknown device
+code. The flow itself needed no fix.
 
 ## Unresolved limitations
 

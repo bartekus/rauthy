@@ -58,6 +58,10 @@ jobs:
           just build-wasm
           just build-ui
 
+      # The frontend half of upstream's `just is-clean`. The rust half is the `checks` job.
+      - name: Check the frontend
+        run: npm --prefix frontend run check
+
       # The generated assets are what gets embedded into the binary, so they are built once and
       # handed to every build job. Rebuilding them per architecture would risk shipping two
       # different frontends under one version.
@@ -170,6 +174,15 @@ jobs:
 
       # jemalloc built with a 64K page size works on 4K and 64K kernels alike; the reverse is not
       # true, so the aarch64 artifact is built the way upstream builds it.
+      # The build dependencies are baked into a throwaway image so that the build itself can run
+      # as the runner's own user: a root-owned target directory cannot be read back out.
+      - name: Prepare the build image
+        run: |
+          set -euxo pipefail
+          # Built from stdin so the whole repository is not sent as build context.
+          printf 'FROM %s\nRUN apt-get update && apt-get install -y --no-install-recommends build-essential clang libpam0g-dev && rm -rf /var/lib/apt/lists/*\n' \
+            "$BUILD_IMAGE" | docker build -t rauthy-ci-builder -
+
       - name: Build in a bookworm container
         run: |
           set -euxo pipefail
@@ -179,14 +192,12 @@ jobs:
           fi
           docker run --rm \
             -v "$PWD":/work -w /work \
+            -u "$(id -u):$(id -g)" \
             -e CARGO_TERM_COLOR=always \
+            -e CARGO_HOME=/work/.cargo-home \
             $jemalloc_env \
-            "$BUILD_IMAGE" \
-            bash -euxc '
-              apt-get update
-              apt-get install -y --no-install-recommends build-essential clang libpam0g-dev
-              cargo build --release --locked
-            '
+            rauthy-ci-builder \
+            bash -euxc 'cargo build --release --locked'
           mv target/release/rauthy "rauthy_${{ matrix.arch }}"
           sha256sum "rauthy_${{ matrix.arch }}" > "rauthy_${{ matrix.arch }}.sha256"
 
@@ -240,15 +251,19 @@ jobs:
           ./rauthy_upstream --version
 
       - name: Run the release acceptance
+        env:
+          # Keep the run inside the workspace so its logs can be uploaded on failure.
+          ACCEPTANCE_WORK: ${{ github.workspace }}/acceptance-work
         run: |
           set -euo pipefail
+          mkdir -p "$ACCEPTANCE_WORK"
           ./assets/release/acceptance.sh "./rauthy_${{ matrix.arch }}" ./rauthy_upstream
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: acceptance-${{ matrix.arch }}
-          path: /tmp/tmp.*/**/*.log
+          path: acceptance-work/**/*.log
           retention-days: 7
           if-no-files-found: ignore
 

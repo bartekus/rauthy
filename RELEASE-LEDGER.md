@@ -59,6 +59,7 @@ each has a test that fails without it. Nothing else from the fork's other branch
 | F3 | `GET /auth/v1/ready` answered `200` unconditionally. | It is the documented readiness probe for Kubernetes and Docker. An orchestrator kept routing to a node whose storage was unreachable. It now answers `503` on the health watcher's confirmed verdict, debounced through the watcher's existing re-check so a leader change does not flap a node out of service. |
 | F4 | A config file that could not be read was replaced by an empty config with only a `warn!`. | A mistyped `--config-file` surfaced as "Missing `encryption.keys`", which sends an operator to the wrong place. Configuring entirely through environment variables stays supported: an absent file at the *default* path is still only a warning. A path the operator named, or a file that exists and cannot be read, is now a startup failure that names itself. |
 | F5 | `zzd_handler_clients::test_clients` compared a global client count across its body while its neighbours in the same test binary created and deleted clients concurrently. | A test defect, repaired rather than tolerated: it made the suite fail on an unrelated schedule. It now asserts about the clients it owns. |
+| F6 | The device grant (RFC 8628) had no test. The well-known document advertised the endpoint and nothing exercised it. | A coverage gap, not a code defect: the consumer drives this flow for its native clients, so the release could not claim it without a test. `test_device_code_flow` now covers the grant request, a poll before approval (`authorization_pending`), an unknown device code, the approval through an authenticated session, and the token set. No product change was needed; the flow works. |
 
 Downstream identity, not a defect fix: the version marker, the startup log line naming distributor
 and upstream base, the `patched.N` marker being recognised instead of warned about as an upstream
@@ -133,7 +134,8 @@ suites run against a live backend on both database backends. Every repair maps t
 | Two processes, one data directory | acceptance E | ownership refusal, first node unharmed |
 | Shutdown, restart, storage recovery | acceptance F | F2, signing-key continuity |
 | Login, session, logout, protected routes | `handler_auth`, `handler_users`, `handler_sessions` | both backends |
-| Native public client, device grant, refresh timing, revocation, bearer writes | `handler_auth::test_token_revocation`, `test_password_flow`, `test_dpop`, `test_client_credentials_flow`, `handler_api_keys` | both backends |
+| Native public client, refresh timing, revocation, bearer-protected writes | `handler_auth::test_token_revocation`, `test_password_flow`, `test_dpop`, `test_client_credentials_flow`, `handler_api_keys` | both backends |
+| Device grant (RFC 8628), including its negative cases | `handler_auth::test_device_code_flow` | **new in this release**, both backends |
 | Audience and scope enforcement, negative cases | `zzf_handler_resource_indicators`, `zzg_handler_token_exchange`, `handler_scopes` | both backends |
 | Fresh backups, rapid repeated requests | `handler_generic::test_backup_download_is_complete` | F1 end to end, length against the listing |
 | Backup read failure reaches the client | `api::backup::tests` | F1 directly |

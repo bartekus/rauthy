@@ -5,7 +5,7 @@ use crate::rauthy_config::RauthyConfig;
 use futures_util::StreamExt;
 use hiqlite::macros::{CacheVariants, embed::*};
 use rauthy_common::{is_hiqlite, is_postgres};
-use rauthy_error::ErrorResponse;
+use rauthy_error::{ErrorResponse, ErrorResponseType};
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use std::env;
@@ -76,23 +76,52 @@ impl DB {
         // checks in the Hiqlite code.
         // This means, even if Postgres is configured, this will still create and start the Hiqlite
         // DB, but it simply won't do anything else than heartbeats between the nodes.
+        // A node that cannot start tears down whatever it had already started before returning.
         let client = hiqlite::start_node_with_cache::<Cache>(config).await?;
 
+        // From here on the node is running and owns the data directory, so a failure in the rest
+        // of the initialization must shut it down before it is returned, or the next start finds
+        // an ungraceful shutdown. `run()` cannot do it: it only sees a client that was stored.
+        if let Err(err) = Self::init_after_start(&client).await {
+            if let Err(shutdown_err) = client.shutdown().await {
+                error!("Error shutting down the database / cache layer: {shutdown_err}");
+            }
+            return Err(err);
+        }
+
+        let _ = HIQLITE_CLIENT.set(client);
+
+        Ok(())
+    }
+
+    async fn init_after_start(client: &hiqlite::Client) -> Result<(), ErrorResponse> {
         if is_postgres() {
-            Self::init_connect_postgres().await?;
+            Self::init_connect_postgres().await
         } else {
-            client.wait_until_healthy_db().await;
+            // Waiting on peers has no natural deadline in a cluster, so the wait itself stays
+            // unbounded. A node that has failed terminally will never become healthy though,
+            // and waiting on it would hang the start forever instead of failing it.
+            while let Err(err) = client
+                .wait_until_healthy_db_timeout(Duration::from_secs(30))
+                .await
+            {
+                if let Some(failure) = client.node_failure() {
+                    error!(
+                        "The database layer failed while starting up: {}",
+                        failure.message()
+                    );
+                    return Err(err.into());
+                }
+                info!("Still waiting for a healthy Raft DB: {err}");
+            }
             let mut metrics = client.metrics_db().await?;
             while metrics.state.is_learner() {
                 info!("Waiting to become a full Raft member");
                 sleep(Duration::from_secs(1)).await;
                 metrics = client.metrics_db().await?;
             }
+            Ok(())
         }
-
-        let _ = HIQLITE_CLIENT.set(client);
-
-        Ok(())
     }
 
     /// Returns the static handle to the Hiqlite client
@@ -207,9 +236,17 @@ impl DB {
 
     async fn init_connect_postgres() -> Result<(), ErrorResponse> {
         let cfg = &RauthyConfig::get().vars.database;
-        let host = cfg.pg_host.as_ref().expect("PG_HOST is not set");
-        let user = cfg.pg_user.as_ref().expect("PG_USER is not set");
-        let password = cfg.pg_password.as_ref().expect("PG_PASSWORD is not set");
+        // This runs after the Hiqlite node has started, so a missing value is an error for
+        // `DB::init()` to act on rather than a panic that skips the storage shutdown.
+        let missing = |name: &str| {
+            ErrorResponse::new(ErrorResponseType::Internal, format!("{name} is not set"))
+        };
+        let host = cfg.pg_host.as_ref().ok_or_else(|| missing("PG_HOST"))?;
+        let user = cfg.pg_user.as_ref().ok_or_else(|| missing("PG_USER"))?;
+        let password = cfg
+            .pg_password
+            .as_ref()
+            .ok_or_else(|| missing("PG_PASSWORD"))?;
         let db_name = cfg.pg_db_name.as_ref();
 
         let pool =

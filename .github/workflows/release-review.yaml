@@ -41,6 +41,7 @@ jobs:
           echo "review credential present"
 
       - uses: anthropics/claude-code-action@v1
+        id: review
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
@@ -80,5 +81,68 @@ jobs:
             finding in its own right.
 
             End with a one-line verdict: whether you found anything that should block this
-            release. Write your findings to `$GITHUB_STEP_SUMMARY` as well, so the run carries
-            them even if posting fails.
+            release. Do not try to post anything yourself: the step after this one takes your
+            final answer and publishes it, so that the review is on the record whether or not you
+            think to put it there.
+
+      # The first review run finished cleanly and left nothing behind: no comment, no job summary,
+      # and the execution log stays on the runner. Publishing the verdict is therefore this
+      # workflow's job, not the reviewer's, so that a review cannot silently evaporate and be
+      # mistaken for an approval.
+      - name: Publish the review
+        if: always() && steps.review.outputs.execution_file != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > review.md
+          import json, os
+
+          raw = open(os.environ["EXECUTION_FILE"]).read()
+          try:
+              entries = json.loads(raw)
+              if not isinstance(entries, list):
+                  entries = [entries]
+          except json.JSONDecodeError:
+              # The log is also written as one JSON object per line in some versions.
+              entries = []
+              for line in raw.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      entries.append(json.loads(line))
+                  except json.JSONDecodeError:
+                      pass
+
+          parts = []
+          for entry in entries:
+              if not isinstance(entry, dict) or entry.get("type") != "assistant":
+                  continue
+              for block in entry.get("message", {}).get("content", []):
+                  if isinstance(block, dict) and block.get("type") == "text":
+                      text = block.get("text", "").strip()
+                      if text:
+                          parts.append(text)
+
+          print(f"## Independent review of `{os.environ['HEAD_SHA'][:12]}`\n")
+          if parts:
+              print(parts[-1])
+          else:
+              print("_The reviewer produced no text output. The execution log is attached to "
+                    "this run as an artifact._")
+          PY
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body-file review.md
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.review.outputs.execution_file != ''
+        with:
+          name: review-execution-log
+          path: ${{ steps.review.outputs.execution_file }}
+          retention-days: 7

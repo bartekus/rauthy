@@ -337,9 +337,17 @@ PR #2's seven rounds reviewed the tree against `hiqlite 0.14.0`; rounds 2, 4 and
 defects (F7, F8, and two acceptance assertions that could not fail), all fixed. That evidence
 stands for the code it reviewed and unchanged since.
 
-**Everything in section 3 marked new, the dependency swap, the acceptance legs and the publication
-workflow have not yet had an independent review.** The review runs on the pull request that
-carries the final graph; its run and its disposition are recorded here when it exists.
+**Round 8** (PR #3, review run `35781889615`, head `1c856af5`, git-sourced graph) reviewed the
+integration diff in full. Verdict: nothing in authentication, readiness, ownership, backup,
+provenance or the publication gate; one real defect in the harness. Leg E's "the first node still
+serves its signing keys" compared with leg B's node, fell back to "the JWKS is not empty", and so
+could not fail. It dated from PR #2 and was counted in every pass figure since. Fixed: the leg
+now compares the node's own keys, taken before the second process's attempt. One statement in the
+review is inaccurate and changes nothing: it calls `/health` unconditional, but it answers `500`
+when storage is unhealthy (acceptance K and P assert that).
+
+The final head, carrying the registry graph, gets its own review round before merge; the publish
+gate requires a successful review run on that exact head.
 
 ## 10. Upstream return path and maintenance
 

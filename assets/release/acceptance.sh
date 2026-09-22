@@ -353,6 +353,7 @@ E="$WORK/e-contend"
 start_node "$E" 8094 8104 8204
 wait_ready "$E" 8094 300
 assert "the first node is serving" $?
+KID_E_BEFORE="$(jwks_kid 8094)"
 
 # The second process gets its own ports but the same data directory.
 E2="$WORK/e-contend-second"; mkdir -p "$E2"; cp "$CONFIG_TEMPLATE" "$E2/config.toml"
@@ -375,8 +376,11 @@ assert "the refusal is the storage-ownership error and changed nothing" $? \
 
 curl -s "http://127.0.0.1:8094/auth/v1/health" | grep -q '"db_healthy":true'
 assert "the first node is unharmed by the second one's attempt" $?
-[ "$(jwks_kid 8094)" = "$KID_FIRST" ] || [ -n "$(jwks_kid 8094)" ]
-assert "the first node still serves its signing keys" $?
+# This node's own keys, taken before the second process tried. An earlier version compared with
+# leg B's node, fell back to "not empty", and could not fail; the independent review found it.
+[ -n "$KID_E_BEFORE" ] && [ "$(jwks_kid 8094)" = "$KID_E_BEFORE" ]
+assert "the first node still serves its own signing keys" $? \
+  "before: $KID_E_BEFORE after: $(jwks_kid 8094)"
 
 # --- F: shutdown, restart, recovery ------------------------------------------
 

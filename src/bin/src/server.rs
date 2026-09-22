@@ -91,7 +91,10 @@ pub async fn run(
     info!(
         "Downstream distribution by '{RAUTHY_DISTRIBUTOR}' from upstream {RAUTHY_UPSTREAM_BASE} \
         ({}), source {RAUTHY_SOURCE_URL} - not an upstream release",
-        &RAUTHY_UPSTREAM_COMMIT[..12]
+        // A short commit, without making a mistyped constant a panic at startup.
+        RAUTHY_UPSTREAM_COMMIT
+            .get(..12)
+            .unwrap_or(RAUTHY_UPSTREAM_COMMIT)
     );
     info!("Log Level set to '{log_level}'");
     if test_mode {

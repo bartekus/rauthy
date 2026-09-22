@@ -54,7 +54,7 @@ each has a test that fails without it. Nothing else from the fork's other branch
 
 | # | Defect | Why it is in this release |
 |---|---|---|
-| F1 | `GET /auth/v1/backup/local/{file}` and `/backup/s3/{object}` ended the response body on a read error exactly as on EOF, under an already-sent `200`. | The consumer's backup verb takes rauthy's snapshot through these routes and checks only the status and a non-empty body, so a truncated SQLite file was sealed into an archive as a good backup. Now the stream fails and the client's read fails with it. |
+| F1 | `GET /auth/v1/backup/local/{file}` and `/backup/s3/{object}` ended the response body on a read error exactly as on EOF, under an already-sent `200`. | The consumer's backup verb takes rauthy's snapshot through these routes and checks only the status and a non-empty body, so a truncated SQLite file was sealed into an archive as a good backup. Both routes now fail the stream instead of ending it, and the local route additionally serves a `Content-Length`, so a short body is detectable by any HTTP client on its own terms rather than only through the server dropping the connection. The S3 route has no length to declare, because it proxies a stream whose size it does not know in advance; there, the stream error is the whole guarantee. |
 | F2 | Any error return after `DB::init()` skipped `DB::hql().shutdown()`. A listener that could not bind returned straight out of `run()`. | The WAL lock stayed held and the state-machine lock file stayed in place, so the next start read the directory as an ungraceful shutdown. With hiqlite's default `auto-heal` feature, which Rauthy enables, that rebuilds the state machine from the raft log. The post-init `expect`/`unwrap` calls became errors for the same reason: `panic = "abort"` runs no cleanup. |
 | F3 | `GET /auth/v1/ready` answered `200` unconditionally. | It is the documented readiness probe for Kubernetes and Docker. An orchestrator kept routing to a node whose storage was unreachable. It now answers `503` on the health watcher's confirmed verdict, debounced through the watcher's existing re-check so a leader change does not flap a node out of service. |
 | F4 | A config file that could not be read was replaced by an empty config with only a `warn!`. | A mistyped `--config-file` surfaced as "Missing `encryption.keys`", which sends an operator to the wrong place. Configuring entirely through environment variables stays supported: an absent file at the *default* path is still only a warning. A path the operator named, or a file that exists and cannot be read, is now a startup failure that names itself. |
@@ -137,7 +137,7 @@ suites run against a live backend on both database backends. Every repair maps t
 | Native public client, refresh timing, revocation, bearer-protected writes | `handler_auth::test_token_revocation`, `test_password_flow`, `test_dpop`, `test_client_credentials_flow`, `handler_api_keys` | both backends |
 | Device grant (RFC 8628), including its negative cases | `handler_auth::test_device_code_flow` | **new in this release**, both backends |
 | Audience and scope enforcement, negative cases | `zzf_handler_resource_indicators`, `zzg_handler_token_exchange`, `handler_scopes` | both backends |
-| Fresh backups, rapid repeated requests | `handler_generic::test_backup_download_is_complete` | F1 end to end, length against the listing |
+| Fresh backups, rapid repeated requests | `handler_generic::test_backup_download_is_complete` | F1 end to end: the declared `Content-Length`, the received length, and the listing's size must all agree |
 | Backup read failure reaches the client | `api::backup::tests` | F1 directly |
 | Restore into fresh storage, identity and key continuity | acceptance G | restore correctness |
 | Invalid / truncated / missing restore input | acceptance G | refusal without destroying the last recoverable state |
@@ -213,20 +213,33 @@ Two workflows, and neither shares a credential with the other's job.
 
 - `release-candidate.yaml` builds the frontend and wasm once, runs style and unit checks, runs the
   integration suite on both backends, builds the release binary per architecture inside a
-  `rust:1.95.0-bookworm` container, runs the acceptance harness against those binaries on native
-  runners for both architectures, and runs the independent review. Every job declares
-  `contents: read`; the review job adds `pull-requests: write` and nothing else. No job references
-  a registry token, and the review is deliberately not wired to `pull_request_target`.
+  `rust:1.95.0-bookworm` container, and runs the acceptance harness against those binaries on
+  native runners for both architectures. Every job declares `contents: read` and nothing else, and
+  no job references a registry token.
+- `release-review.yaml` is the independent review, and it is a separate file for an empirical
+  reason: `claude-code-action` refuses a `push` event outright ("Unsupported event type: push"),
+  which the first candidate run established rather than assumed. It therefore hangs off the pull
+  request that opens the release line. It is `pull_request`, never `pull_request_target`, so a
+  fork's code gets no secrets and a read-only token. The job holds `contents: read` and
+  `pull-requests: write`, and no publication credential.
 - `release-publish.yaml` builds no code. It takes the binaries a named candidate run produced,
   verifies them against their recorded checksums, packages them, pushes the multi-architecture
   image, attests it, pulls it back by digest, compares the shipped binary against the tested bytes,
   and only then creates the release. It refuses to run if the tag already exists in the registry
   and refuses if the version asked for does not match `Cargo.toml`.
 
-The bookworm build container is not cosmetic: it puts a glibc 2.36 floor under the artifact.
-Building on the runner's own glibc would raise that floor above what `distroless/cc-debian12` and
-the consumer's `debian:bookworm-slim` runtime provide, and the binary would not run where it has
-to.
+The bookworm build container is not cosmetic: it puts a glibc floor under the artifact that the
+consumer's runtime can meet. Measured on the candidate binaries: both require at most
+`GLIBC_2.34`, and `debian:bookworm-slim` provides 2.36. Building on the runner's own glibc (2.39
+on `ubuntu-24.04`) would raise that floor above what `distroless/cc-debian12` and the consumer's
+`debian:bookworm-slim` runtime provide, and the binary would not run where it has to.
+
+The consumer's consumption pattern was exercised directly against the candidate binaries, in an
+isolated workspace and without touching the consumer's checkout: the image was built from them,
+`/app/rauthy` copied out of it into `debian:bookworm-slim` exactly as `rahi`'s Dockerfile does,
+and the result runs and reports `rauthy 0.36.2-patched.1`. The image labels were read back off the
+built image and carry upstream's authorship and licence alongside the downstream source, vendor
+and upstream-base labels.
 
 `CARGO_REGISTRY_TOKEN` is present as a repository secret and is referenced by no workflow. This
 release publishes binaries and an OCI image; it publishes no Rust package, so it needs no crates.io

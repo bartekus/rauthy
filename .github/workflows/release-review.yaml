@@ -1,0 +1,84 @@
+# Independent review of a release candidate.
+#
+# Separate from release-candidate.yaml for one empirical reason: claude-code-action refuses a
+# `push` event ("Unsupported event type: push"), so the review has to hang off the pull request
+# that opens the release line. Keeping it in its own file also means the review is not re-run by
+# every push to the branch, and that the whole build matrix is not re-run by every pull request.
+#
+# Trigger safety: this is `pull_request`, not `pull_request_target`. A pull request from a fork
+# therefore gets no secrets and a read-only token, so untrusted code cannot reach the review
+# credential. The job holds no publication credential of any kind.
+name: release review
+
+on:
+  pull_request:
+    branches:
+      - 'patched/**'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  review:
+    name: independent review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the review credential is present
+        env:
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "CLAUDE_CODE_OAUTH_TOKEN is not set; the review cannot run" >&2
+            exit 1
+          fi
+          echo "review credential present"
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          # Read the tree and run git. The job's `permissions` above are the real boundary:
+          # `contents: read` and `pull-requests: write`, and nothing that could publish.
+          claude_args: '--allowedTools "Bash,Read,Grep,Glob"'
+          prompt: |
+            Review this pull request against the tag `v0.36.2`, which is the upstream release it
+            is based on: `git diff v0.36.2...HEAD`.
+
+            This is a downstream patched distribution of Rauthy, an identity provider. Report
+            concrete defects with a file and line, and say plainly when a concern does not hold.
+            Do not restate what the code does. Focus on, in order:
+
+            1. Authentication and authorization regressions. Anything that weakens MFA, TLS
+               verification, token validation, audience or scope enforcement, or admin-session
+               checks is the most serious finding available.
+            2. Error and readiness propagation out of the storage layer: whether a failure can
+               still reach a caller as a success, and whether `/ready` and `/health` can report
+               healthy while storage is not.
+            3. Storage ownership and shutdown: whether any exit path after the storage layer
+               starts can skip its shutdown, and whether a second process could touch a data
+               directory another process owns.
+            4. Backup, restore and upgrade safety: truncation, partial writes, destroying the last
+               recoverable state, and the version stamped into the database locking out a
+               rollback to upstream v0.36.2.
+            5. Dependency and package provenance: whether anything resolves to an unexpected
+               source. Note that the patched Hiqlite packages this release is meant to consume are
+               not published yet, which `RELEASE-LEDGER.md` section 7 records as a hold; that is
+               known, not a finding.
+            6. Workflow permissions and publication correctness: over-broad `permissions`, a
+               credential reachable from untrusted code, or a publication destination that is not
+               under the bartekus namespace.
+
+            `RELEASE-LEDGER.md` states what this release claims, and `RELEASE-HANDOFF.md` states
+            what the consumer is told. Treat a claim in either that the code does not support as a
+            finding in its own right.
+
+            End with a one-line verdict: whether you found anything that should block this
+            release. Write your findings to `$GITHUB_STEP_SUMMARY` as well, so the run carries
+            them even if posting fails.

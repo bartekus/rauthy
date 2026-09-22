@@ -1,4 +1,5 @@
 use crate::ReqPrincipal;
+use actix_web::body::SizedStream;
 use actix_web::http::header::CONTENT_DISPOSITION;
 use actix_web::mime::APPLICATION_OCTET_STREAM;
 use actix_web::web::Path;
@@ -133,19 +134,23 @@ pub async fn get_backup_local(
     validate_hiqlite()?;
 
     let file = DB::hql().backup_file_local(&filename).await?;
+    let len = file.metadata().await?.len();
     let rdr = BufReader::new(file);
 
     let (tx, rx) = futures::channel::mpsc::channel(1);
 
     task::spawn(pump_reader(rdr, tx, filename.clone()));
 
+    // `SizedStream` rather than `streaming`, so the response carries a `Content-Length`. It makes
+    // a short body detectable by any HTTP client on its own terms, without depending on the
+    // server aborting the connection for the client to notice.
     Ok(HttpResponse::Ok()
         .content_type(APPLICATION_OCTET_STREAM)
         .insert_header((
             CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),
         ))
-        .streaming(rx.into_stream()))
+        .body(SizedStream::new(len, rx.into_stream())))
 }
 
 /// Download an S3 backup

@@ -176,6 +176,14 @@ async fn test_backup_download_is_complete() -> Result<(), Box<dyn Error>> {
             .send()
             .await?;
         assert_eq!(res.status(), 200);
+        // The response declares how long the file is, so a client can detect a short body without
+        // relying on the server aborting the connection.
+        assert_eq!(
+            res.content_length(),
+            Some(listing.size),
+            "the download of {} must declare its length",
+            listing.name
+        );
         let bytes = res.bytes().await?;
 
         assert_eq!(

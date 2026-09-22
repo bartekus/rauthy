@@ -47,11 +47,16 @@ assert() { # assert <name> <condition-result> <detail>
 # --- process helpers ---------------------------------------------------------
 
 # start_node <dir> <http-port> <raft-port> <api-port> [extra env assignments...]
-# Writes the pid to $dir/pid and the log to $dir/rauthy.log. Returns immediately.
+#
+# Writes the node's pid to $dir/pid, its log to $dir/rauthy.log, and, once it exits, its real
+# exit code to $dir/rc. The wrapper subshell exists for that last part: the node is started
+# inside it so that something is left to `wait` on it. Reading `$?` from the caller would not
+# work, because the node is not the calling shell's own child, and `wait` would answer 127.
 start_node() {
   local dir="$1" http="$2" raft="$3" api="$4"; shift 4
   mkdir -p "$dir"
   [ -f "$dir/config.toml" ] || cp "$CONFIG_TEMPLATE" "$dir/config.toml"
+  rm -f "$dir/rc" "$dir/pid"
   (
     cd "$dir"
     env "$@" \
@@ -64,11 +69,19 @@ start_node() {
       BOOTSTRAP_ADMIN_EMAIL="$ADMIN_EMAIL" \
       BOOTSTRAP_ADMIN_PASSWORD_PLAIN="$ADMIN_PASSWORD" \
       "${BIN:-$RAUTHY}" serve -c config.toml >> "$dir/rauthy.log" 2>&1 &
-    echo $! > "$dir/pid"
-  )
+    node=$!
+    echo "$node" > "$dir/pid"
+    wait "$node"
+    echo $? > "$dir/rc"
+  ) &
+  # Give the inner start a moment to publish its pid, so a caller can signal it.
+  for _ in $(seq 1 50); do [ -f "$dir/pid" ] && break; sleep 0.1; done
 }
 
 # wait_ready <dir> <http-port> <seconds>
+#
+# The budget has to cover a first boot, which generates the signing keys. That is seconds in a
+# release build and minutes in a debug one, so it is set for the slow case.
 wait_ready() {
   local dir="$1" http="$2" budget="${3:-90}" i=0
   while [ "$i" -lt "$budget" ]; do
@@ -82,31 +95,35 @@ wait_ready() {
   return 1
 }
 
-# stop_node <dir> - graceful SIGTERM, then wait. Returns the node's exit code.
+# stop_node <dir> - graceful SIGTERM, then wait for the node to actually go.
 stop_node() {
   local dir="$1" pid
   [ -f "$dir/pid" ] || return 0
   pid="$(cat "$dir/pid")"
-  kill -TERM "$pid" 2>/dev/null || return 0
+  kill -TERM "$pid" 2>/dev/null || { rm -f "$dir/pid"; return 0; }
   local i=0
-  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
-  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+  while [ ! -f "$dir/rc" ] && [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
+  if [ ! -f "$dir/rc" ]; then kill -KILL "$pid" 2>/dev/null; sleep 2; fi
   rm -f "$dir/pid"
   return 0
 }
 
 # run_until_exit <dir> <http-port> <raft-port> <api-port> <budget> [env...]
-# Starts a node that is expected to fail, and returns its exit code (124 on timeout).
+# Starts a node that is expected to fail, and returns the exit code it actually exited with
+# (124 if it was still running when the budget ran out).
 run_until_exit() {
   local dir="$1" http="$2" raft="$3" api="$4" budget="$5"; shift 5
   start_node "$dir" "$http" "$raft" "$api" "$@"
-  local pid; pid="$(cat "$dir/pid")" ; local i=0
-  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$budget" ]; do sleep 1; i=$((i + 1)); done
-  if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; rm -f "$dir/pid"; return 124; fi
-  wait "$pid" 2>/dev/null
-  local rc=$?
+  local i=0
+  while [ ! -f "$dir/rc" ] && [ "$i" -lt "$budget" ]; do sleep 1; i=$((i + 1)); done
+  if [ ! -f "$dir/rc" ]; then
+    [ -f "$dir/pid" ] && kill -KILL "$(cat "$dir/pid")" 2>/dev/null
+    rm -f "$dir/pid"
+    return 124
+  fi
+  local rc; rc="$(cat "$dir/rc")"
   rm -f "$dir/pid"
-  return $rc
+  return "$rc"
 }
 
 # A data directory is "clean" when a fresh start does not report an ungraceful shutdown.
@@ -125,6 +142,11 @@ unclean_markers() {
 # Every `kid` the instance publishes, sorted. The whole set matters, not one of them: rauthy
 # serves a key per algorithm and the JWKS order is not stable, so comparing a single entry would
 # compare different keys on either side.
+sha256_of() {
+  if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
 jwks_kid() {
   curl -s "http://127.0.0.1:$1/auth/v1/oidc/certs" \
     | tr ',' '\n' | grep -o '"kid":"[^"]*"' | sort | tr '\n' ' '
@@ -148,7 +170,7 @@ assert "version output names the patched build" $? "got: $VERSION_OUT"
 log "B. First boot with valid configuration"
 B="$WORK/b-first-boot"
 start_node "$B" 8091 8101 8201
-wait_ready "$B" 8091 120
+wait_ready "$B" 8091 300
 assert "first boot becomes ready" $? "see $B/rauthy.log"
 
 curl -s "http://127.0.0.1:8091/auth/v1/health" | grep -q '"db_healthy":true'
@@ -187,7 +209,7 @@ assert "the malformed-config failure names the problem" $? "$(tail -3 "$C/malfor
 
 # Conflicting: Postgres selected as the backend, with no Postgres to connect to.
 CONF="$C/conflicting"; mkdir -p "$CONF"; cp "$CONFIG_TEMPLATE" "$CONF/config.toml"
-run_until_exit "$CONF" 8092 8102 8202 90 HIQLITE=false PG_HOST=127.0.0.1 PG_PORT=1 \
+run_until_exit "$CONF" 8092 8102 8202 180 HIQLITE=false PG_HOST=127.0.0.1 PG_PORT=1 \
   PG_USER=nobody PG_PASSWORD=nothing
 RC=$?
 [ "$RC" -ne 0 ]
@@ -210,7 +232,7 @@ time.sleep(600)
 SQUATTER=$!
 sleep 2
 
-run_until_exit "$D" 8093 8103 8203 120
+run_until_exit "$D" 8093 8103 8203 240
 RC=$?
 [ "$RC" -ne 0 ]
 assert "a listener that cannot bind fails the start" $? "exit code was $RC"
@@ -222,7 +244,7 @@ sleep 1
 # so the next start found an ungraceful shutdown and rebuilt the state machine.
 mv "$D/rauthy.log" "$D/bind-failure.log"
 start_node "$D" 8093 8103 8203
-wait_ready "$D" 8093 120
+wait_ready "$D" 8093 300
 assert "the node starts again after a bind failure" $? "see $D/rauthy.log"
 [ "$(unclean_markers "$D")" = "0" ]
 assert "the bind failure shut the storage layer down cleanly" $? \
@@ -234,7 +256,7 @@ stop_node "$D"
 log "E. Two processes contending for one data directory"
 E="$WORK/e-contend"
 start_node "$E" 8094 8104 8204
-wait_ready "$E" 8094 120
+wait_ready "$E" 8094 300
 assert "the first node is serving" $?
 
 # The second process gets its own ports but the same data directory.
@@ -264,10 +286,12 @@ assert "the first node still serves its signing keys" $?
 log "F. Shutdown, restart and recovery"
 KID_E="$(jwks_kid 8094)"
 stop_node "$E"
+[ "$(cat "$E/rc" 2>/dev/null)" = "0" ]
+assert "SIGTERM exits cleanly" $? "exit code was $(cat "$E/rc" 2>/dev/null || echo none)"
 sleep 3
 mv "$E/rauthy.log" "$E/first-run.log"
 start_node "$E" 8094 8104 8204
-wait_ready "$E" 8094 120
+wait_ready "$E" 8094 300
 assert "the node restarts on its existing data" $? "see $E/rauthy.log"
 [ "$(unclean_markers "$E")" = "0" ]
 assert "a graceful shutdown leaves nothing to recover" $? \
@@ -311,7 +335,7 @@ if [ -n "$BACKUP_FILE" ]; then
   G="$WORK/g-restore"; mkdir -p "$G"; cp "$CONFIG_TEMPLATE" "$G/config.toml"
   cp "$BACKUP_FILE" "$G/backup.sqlite"
   start_node "$G" 8096 8106 8206 "HQL_BACKUP_RESTORE=file:$G/backup.sqlite"
-  wait_ready "$G" 8096 180
+  wait_ready "$G" 8096 300
   assert "a restore into fresh storage comes up" $? "see $G/rauthy.log"
   ! grep -q "Initializing empty production database" "$G/rauthy.log"
   assert "the restored instance used the restored data instead of bootstrapping" $? \
@@ -326,16 +350,16 @@ if [ -n "$BACKUP_FILE" ]; then
   # Corrupt restore input must be refused, and must not destroy what is on disk.
   H="$WORK/h-bad-restore"; mkdir -p "$H"; cp "$CONFIG_TEMPLATE" "$H/config.toml"
   head -c 4096 "$BACKUP_FILE" > "$H/truncated.sqlite"
-  BEFORE_SUM="$(shasum -a 256 "$BACKUP_FILE" | cut -d' ' -f1)"
-  run_until_exit "$H" 8097 8107 8207 120 "HQL_BACKUP_RESTORE=file:$H/truncated.sqlite"
+  BEFORE_SUM="$(sha256_of "$BACKUP_FILE")"
+  run_until_exit "$H" 8097 8107 8207 240 "HQL_BACKUP_RESTORE=file:$H/truncated.sqlite"
   RC=$?
   [ "$RC" -ne 0 ]
   assert "a truncated restore input is refused" $? "exit code was $RC"
-  [ "$(shasum -a 256 "$BACKUP_FILE" | cut -d' ' -f1)" = "$BEFORE_SUM" ]
+  [ "$(sha256_of "$BACKUP_FILE")" = "$BEFORE_SUM" ]
   assert "the refused restore did not touch the last recoverable state" $?
 
   I="$WORK/i-missing-restore"; mkdir -p "$I"; cp "$CONFIG_TEMPLATE" "$I/config.toml"
-  run_until_exit "$I" 8098 8108 8208 120 "HQL_BACKUP_RESTORE=file:$I/does-not-exist.sqlite"
+  run_until_exit "$I" 8098 8108 8208 240 "HQL_BACKUP_RESTORE=file:$I/does-not-exist.sqlite"
   RC=$?
   [ "$RC" -ne 0 ]
   assert "a missing restore input is refused" $? "exit code was $RC"
@@ -350,7 +374,7 @@ if [ -z "$UPSTREAM" ]; then
 else
   J="$WORK/j-upgrade"
   BIN="$UPSTREAM" start_node "$J" 8099 8109 8209
-  wait_ready "$J" 8099 120
+  wait_ready "$J" 8099 300
   assert "the upstream baseline boots and populates a data directory" $? "see $J/rauthy.log"
   KID_UP="$(jwks_kid 8099)"
   stop_node "$J"
@@ -358,7 +382,7 @@ else
 
   mv "$J/rauthy.log" "$J/upstream-run.log"
   start_node "$J" 8099 8109 8209
-  wait_ready "$J" 8099 180
+  wait_ready "$J" 8099 300
   assert "the patched build starts on the upstream data directory" $? "see $J/rauthy.log"
   [ "$(jwks_kid 8099)" = "$KID_UP" ]
   assert "the upgrade keeps the signing key" $? "before: $KID_UP after: $(jwks_kid 8099)"
@@ -370,7 +394,7 @@ else
   # Rollback: the version this build stamps into the config table must not lock upstream out.
   mv "$J/rauthy.log" "$J/patched-run.log"
   BIN="$UPSTREAM" start_node "$J" 8099 8109 8209
-  wait_ready "$J" 8099 180
+  wait_ready "$J" 8099 300
   assert "the upstream baseline still starts after the upgrade" $? \
     "rollback is blocked: $(tail -5 "$J/rauthy.log")"
   stop_node "$J"
@@ -400,7 +424,7 @@ else
   K="$WORK/k-storage-failure"
   start_node "$K" 8090 8110 8210 HIQLITE=false PG_HOST=127.0.0.1 PG_PORT=5439 \
     PG_USER=rauthy PG_PASSWORD=123SuperSafe
-  wait_ready "$K" 8090 180
+  wait_ready "$K" 8090 300
   RC=$?
   if [ "$RC" -ne 0 ]; then
     bad "the Postgres-backed node comes up" "see $K/rauthy.log"

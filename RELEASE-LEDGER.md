@@ -142,9 +142,19 @@ Reported to the Hiqlite release owner with evidence; repaired in `bartekus/hiqli
 
 | Package | Selected | Source in the current candidate |
 |---|---|---|
-| `hiqlite-patched` | `=0.15.0-patched.1` via `hiqlite = { package = "hiqlite-patched", ... }` | git `bartekus/hiqlite` @ `e1e9135587015310be5b8f259e5b86368f131ae8` |
-| `hiqlite-wal-patched` | pulled in by the above | same |
-| `hiqlite-derive-patched` | pulled in by the above | same |
+| `hiqlite-patched` | `=0.15.0-patched.1` via `hiqlite = { package = "hiqlite-patched", ... }` | crates.io, `456c1c117e5c581f6638572f26d9ef7cd567738c578e42ff0c8e09300534e7ca` |
+| `hiqlite-wal-patched` | pulled in by the above | crates.io, `024992a08719a870bcef79192ed392cbef758b39caf0a60167541df379a05a9b` |
+| `hiqlite-derive-patched` | pulled in by the above | crates.io, `e2380bba9eb80f5d7ecb5a59097b91bed1a3600f9d6e659ad37362e6cb2df077` |
+
+Provenance, checked independently of the Hiqlite owner's report: the crates.io API returns these
+three checksums, none yanked, published by `bartekus` on 2026-09-22; each downloaded `.crate`
+hashes to its checksum and its `.cargo_vcs_info.json` records commit
+`3392c12033f42f571b806d9ec24c5c5c9c40999a`, not dirty; that commit is the target of the annotated
+tag `v0.15.0-patched.1` in `bartekus/hiqlite`
+(https://github.com/bartekus/hiqlite/releases/tag/v0.15.0-patched.1). Against the last git
+candidate this release was exercised on (`e1e91355`), the published tree changes WAL rollover and
+flush failure handling, S3 retention filtering, the cache-format check on a reset start, and a
+dlock handler; acceptance P injects exactly the rollover failure.
 | `openraft` | `0.9.25` | crates.io, `a97014fb78acb77be3a40ac2da305f6dd3a6b243f3a908ace87d29b3972eaafd` |
 
 The alias keeps the dependency key `hiqlite`, so no `use hiqlite::...` moves and the derive
@@ -158,8 +168,7 @@ openraft versions); the published `hiqlite-patched` pins `=0.9.25`.
 
 `assets/release/check_graph.py` is the single definition of a release graph, used by both
 workflows: exactly one copy of each patched package, all from crates.io with a checksum, none of
-upstream's `hiqlite*` packages, one `openraft`. The current git-sourced graph passes its shape
-check and **fails** its release check, which is correct.
+upstream's `hiqlite*` packages, one `openraft`. The graph passes both its shape check and its release check.
 
 ## 5. Compatibility
 

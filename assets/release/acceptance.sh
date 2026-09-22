@@ -526,9 +526,12 @@ else
     && grep -q "Nothing was changed" "$J/rauthy.log"
   assert "the refusal names the cache log, the opt-in, and that nothing changed" $? \
     "$(tail -3 "$J/rauthy.log")"
-  # The Raft log must be byte for byte what upstream left. The database is compared by content:
-  # the refusal comes after the SQLite group has opened the file, which checkpoints its WAL and
-  # records optimizer statistics in `sqlite_stat1`, so its bytes change while its data does not.
+  # Byte for byte, apart from the ownership lock the refusing process takes first. An earlier
+  # Hiqlite candidate refused only after opening the database, which checkpointed its WAL; this
+  # is the assertion that caught it.
+  diff -r -x hiqlite-owner.lock "$J/data" "$J/data-as-upstream-left-it" > /dev/null
+  assert "the refused upgrade left every file byte-identical" $? \
+    "$(diff -rq -x hiqlite-owner.lock "$J/data" "$J/data-as-upstream-left-it" | head -5)"
   diff -r "$J/data/logs" "$J/data-as-upstream-left-it/logs" > /dev/null
   assert "the refused upgrade left the database's raft log byte-identical" $?
   python3 - "$J/data-as-upstream-left-it/state_machine/db/hiqlite.db" \
@@ -858,10 +861,20 @@ else
 
   P_FAILED=1
   for i in $(seq 1 3000); do
-    code="$(create_group 8084 "acceptance_fill_$i")"
-    if [ "$code" != "200" ]; then P_FAILED=0; break; fi
+    P_BODY="$(curl -s -w '\n%{http_code}' -X POST -H "$API_KEY_HEADER" \
+      -H 'Content-Type: application/json' -d "{\"group\":\"acceptance_fill_$i\"}" \
+      "http://127.0.0.1:8084/auth/v1/groups")"
+    if [ "$(printf '%s' "$P_BODY" | tail -1)" != "200" ]; then P_FAILED=0; break; fi
   done
   assert "the injected storage failure reaches the writer" $P_FAILED "3000 writes were all accepted"
+  # The write that meets the failure is refused on a different path from every later one: it is
+  # the append the writer failed on, answered with the writer's own account, which names the log
+  # directory. That must not reach the client either.
+  echo "  INFO the write that met the failure: $(printf '%s' "$P_BODY" | tail -1)" \
+    "$(printf '%s' "$P_BODY" | sed '$d' | head -c 200)"
+  ! printf '%s' "$P_BODY" | grep -q "$P_LOGS"
+  assert "the write that meets the failure does not expose the storage path" $? \
+    "$(printf '%s' "$P_BODY" | head -c 300)"
 
   READY_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8084/auth/v1/ready")"
   for _ in $(seq 1 10); do

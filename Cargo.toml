@@ -106,7 +106,7 @@ futures-util = "0.3"
 gethostname = "1"
 hex = { version = "0.4", features = ["serde"] }
 hickory-resolver = "0.26.1"
-hiqlite = { package = "hiqlite-patched", version = "=0.15.0-patched.1", git = "https://github.com/bartekus/hiqlite", rev = "34641b0a4b1d64ff1df24a6bd931c1dc4ff62b61", features = [
+hiqlite = { package = "hiqlite-patched", version = "=0.15.0-patched.1", git = "https://github.com/bartekus/hiqlite", rev = "e1e9135587015310be5b8f259e5b86368f131ae8", features = [
     "cache", "cast_ints", "counters", "dashboard", "listen_notify_local", "macros"
 ] }
 hmac-sha256 = { version = "1.1.7", features = ["traits010"] }

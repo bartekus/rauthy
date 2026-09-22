@@ -198,9 +198,14 @@ pub async fn get_backup_s3(
                     error!(?err, "Download S3 Backup error");
                     // Fail the body rather than ending it. A `break` here would close the
                     // stream cleanly and hand the client a truncated backup under a 200.
+                    //
+                    // The cause goes to the log, not to the client: an object-store error can
+                    // carry an endpoint, a signed URL or a key, and this text is the one thing
+                    // here that does not pass through `From<hiqlite::Error> for ErrorResponse`.
                     let _ = tx
                         .send(Err(format!(
-                            "S3 backup {object_err} could not be read: {err}"
+                            "S3 backup {object_err} could not be read in full; \
+                            see the server log"
                         )))
                         .await;
                     break;

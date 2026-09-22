@@ -429,6 +429,53 @@ else
   stop_node "$J"
 fi
 
+# --- M: TLS is an exit path too -----------------------------------------------
+
+log "M. TLS material that cannot be used fails cleanly"
+# Every scenario above runs over plain HTTP, so without this one nothing exercises the code that
+# loads or generates TLS material - which runs after the storage layer is live and is therefore
+# in exactly the class of exit path this release is about.
+
+# M1: self-signed generation is the default path for a node told to serve HTTPS with no material.
+M="$WORK/m-tls-self-signed"; mkdir -p "$M"
+start_node "$M" 8087 8117 8217 LISTEN_SCHEME=https LISTEN_PORT_HTTPS=8447 TLS_GENERATE_SELF_SIGNED=true
+# `wait_ready` speaks HTTP; this node serves HTTPS only, so poll it directly.
+tls_ready=1
+for _ in $(seq 1 300); do
+  if [ "$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:8447/auth/v1/ready")" = "200" ]; then
+    tls_ready=0; break
+  fi
+  [ -f "$M/rc" ] && break
+  sleep 1
+done
+assert "a node serving HTTPS with generated material comes up" $tls_ready "see $M/rauthy.log"
+curl -sk "https://127.0.0.1:8447/auth/v1/health" | grep -q '"db_healthy":true'
+assert "the HTTPS node is healthy over TLS" $?
+stop_node "$M"
+
+# M2: material that exists but cannot be used must be an error, not an abort, and must leave the
+# data directory clean.
+N="$WORK/n-tls-broken"; mkdir -p "$N/material"
+printf 'this is not a certificate
+' > "$N/material/tls.crt"
+printf 'this is not a key
+' > "$N/material/tls.key"
+run_until_exit "$N" 8086 8116 8216 300 LISTEN_SCHEME=https LISTEN_PORT_HTTPS=8446   TLS_GENERATE_SELF_SIGNED=false "TLS_CERT=$N/material/tls.crt"   "TLS_KEY=$N/material/tls.key"
+RC=$?
+[ "$RC" -ne 0 ]
+assert "unusable TLS material fails the start" $? "exit code was $RC"
+grep -qiE 'TLS (key|certificate)' "$N/rauthy.log"
+assert "the failure names the TLS material" $? "$(tail -3 "$N/rauthy.log")"
+
+mv "$N/rauthy.log" "$N/tls-failure.log"
+start_node "$N" 8086 8116 8216
+wait_ready "$N" 8086 300
+assert "the node starts over HTTP once the TLS material is out of the way" $? "see $N/rauthy.log"
+[ "$(unclean_markers "$N")" = "0" ]
+assert "the TLS failure shut the storage layer down cleanly" $? \
+  "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$N/rauthy.log" | head -3)"
+stop_node "$N"
+
 # --- L: the metrics listener is an exit path too ------------------------------
 
 log "L. A metrics listener that cannot start fails cleanly"

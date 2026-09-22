@@ -130,7 +130,7 @@ All of the following ran in CI against the candidate's own artefacts.
 | Release binary, `linux/amd64` and `linux/arm64` | built, checksummed |
 | Acceptance against the `linux/amd64` release binary | **0 failed, 0 skipped** |
 | Acceptance against the `linux/arm64` release binary | **0 failed, 0 skipped** |
-| Independent review | ran; one finding, fixed and covered by a new acceptance leg |
+| Independent review | two rounds; one finding each, both fixed and each covered by a new acceptance leg |
 
 Both architectures get the same acceptance, on their own native runner, against the binary that
 ships. That includes the upgrade and rollback legs, which run against the real upstream `v0.36.2`
@@ -161,7 +161,11 @@ covered); N = 3 (not attempted, not claimed); bit-for-bit reproducibility (not c
 4. An unreadable config file fails the start and names itself.
 5. A metrics listener that cannot start is now an error rather than a process abort, so it does
    not cost the next start its state machine either. Found by the independent review.
-6. A shared-state defect in upstream's own client handler test.
+6. TLS material that cannot be used, and a self-signed certificate that cannot be renewed, are
+   now errors rather than process aborts. The renewal one matters most: it ran in a background
+   task and could abort a healthy, serving node hours after startup. Found by the independent
+   review.
+7. A shared-state defect in upstream's own client handler test.
 
 And one coverage gap closed without a product change: the device grant (RFC 8628) had no test in
 rauthy's own suite, although `rahi` drives it for native clients. `test_device_code_flow` now

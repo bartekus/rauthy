@@ -365,7 +365,7 @@ async fn server_with_metrics() -> std::io::Result<()> {
                         "{listen_addr}:{}",
                         RauthyConfig::get().vars.server.port_https
                     ),
-                    tls::load_tls().await,
+                    tls::load_tls().await?,
                 )?
                 .run()
                 .await
@@ -382,7 +382,7 @@ async fn server_with_metrics() -> std::io::Result<()> {
                         "{listen_addr}:{}",
                         RauthyConfig::get().vars.server.port_https
                     ),
-                    tls::load_tls().await,
+                    tls::load_tls().await?,
                 )?
                 .run()
                 .await
@@ -452,7 +452,7 @@ async fn server_without_metrics() -> std::io::Result<()> {
                         "{listen_addr}:{}",
                         RauthyConfig::get().vars.server.port_https
                     ),
-                    tls::load_tls().await,
+                    tls::load_tls().await?,
                 )?
                 .run()
                 .await
@@ -469,7 +469,7 @@ async fn server_without_metrics() -> std::io::Result<()> {
                         "{listen_addr}:{}",
                         RauthyConfig::get().vars.server.port_https
                     ),
-                    tls::load_tls().await,
+                    tls::load_tls().await?,
                 )?
                 .run()
                 .await

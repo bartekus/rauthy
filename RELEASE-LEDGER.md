@@ -59,6 +59,7 @@ each has a test that fails without it. Nothing else from the fork's other branch
 | F3 | `GET /auth/v1/ready` answered `200` unconditionally. | It is the documented readiness probe for Kubernetes and Docker. An orchestrator kept routing to a node whose storage was unreachable. It now answers `503` on the health watcher's confirmed verdict, debounced through the watcher's existing re-check so a leader change does not flap a node out of service. |
 | F4 | A config file that could not be read was replaced by an empty config with only a `warn!`. | A mistyped `--config-file` surfaced as "Missing `encryption.keys`", which sends an operator to the wrong place. Configuring entirely through environment variables stays supported: an absent file at the *default* path is still only a warning. A path the operator named, or a file that exists and cannot be read, is now a startup failure that names itself. |
 | F5 | `zzd_handler_clients::test_clients` compared a global client count across its body while its neighbours in the same test binary created and deleted clients concurrently. | A test defect, repaired rather than tolerated: it made the suite fail on an unrelated schedule. It now asserts about the clients it owns. |
+| F8 | `load_tls()` and the self-signed certificate renewal task panicked in four places reached after `DB::init()`, and `tls_hot_reload::load_server_config` panics internally on material it cannot use. | Found by the second review round, which was right that this is the same defect class as F2 and F7 and that no leg exercised it: every scenario ran over plain HTTP. It is reachable in an ordinary production configuration, because rauthy falls back to generating self-signed material whenever the configured `cert_path`/`key_path` are simply missing, and the renewal task carries the panic into a long-running background task that can abort a healthy, serving node hours later. `load_tls()` is now fallible and its error reaches `run()`; the key and certificate are read and parsed before the hot-reload library sees them, which turns the reachable failures into errors instead of a panic inside a dependency; and the renewal task reports and retries instead of panicking, because an unrenewable certificate is survivable and an aborted node with a live storage layer is not. |
 | F7 | `server_with_metrics()` still panicked in five places reached after `DB::init()`: two metrics-builder `unwrap`s, a `panic!` on a malformed `metrics_addr`, the metrics listener's `bind().unwrap()`, and the `block_on().unwrap()` around its run loop. | Found by the independent review, which correctly read this as a counterexample to F2's own claim of completeness rather than a separate issue. Under `panic = "abort"` these abort the process from any thread with no cleanup, so with `metrics_enable = true` a taken metrics port cost the next start its state machine, exactly the failure F2 exists to close. The configuration is now validated and the metrics port bound in the async function, where a failure is an error `run()` can act on, and only an already-bound listener is handed to the thread. The run loop's own failure is logged rather than fatal: metrics are opt-in and auxiliary, and losing them does not justify aborting an identity provider, least of all in the one way that skips the storage shutdown. |
 | F6 | The device grant (RFC 8628) had no test. The well-known document advertised the endpoint and nothing exercised it. | A coverage gap, not a code defect: the consumer drives this flow for its native clients, so the release could not claim it without a test. `test_device_code_flow` now covers the grant request, a poll before approval (`authorization_pending`), an unknown device code, the approval through an authenticated session, and the token set. No product change was needed; the flow works. |
 
@@ -82,6 +83,17 @@ normally on the same data directory.
 Upstream's third marker is `Node did not shut down gracefully - auto-rebuilding State Machine`: a
 failed bind costs it the state machine, which is then rebuilt from the raft log. This is the
 defect, not an inference about it.
+
+### F8, measured against the upstream binary
+
+The same shape as F2, run in the same container image, with `scheme = https` and a certificate and
+key that exist but are not usable.
+
+| | upstream `v0.36.2` | `0.36.2-patched.1` |
+|---|---|---|
+| Exit code | **134** (`SIGABRT`) | 1 |
+| `Shutdown complete` during that start | **0** | 3 |
+| Last line of output | a panic backtrace note | `The TLS key <path> is not a usable PEM private key: no items found` |
 
 ### Contracts traced that needed no change
 
@@ -177,6 +189,7 @@ not a rebuild of it.
 | Release identity and version parsing | acceptance A, `db_version::tests` | `--version`, marker handling, rollback safety |
 | Identity survives restore and upgrade | acceptance B, G, J | the bootstrapped credential authenticates and the original admin is readable, on a first boot, after a restore, and after an upgrade |
 | A metrics listener that cannot start | acceptance L | F7: the failure is an error, not an abort, and the data directory stays clean |
+| Serving HTTPS, with generated and with unusable TLS material | acceptance M | F8: the generated path comes up and serves over TLS; unusable material is an error that names the file, and the data directory stays clean |
 
 ### Legs not covered, and why
 
@@ -309,6 +322,18 @@ F7 was fixed rather than added to the disclosed limitations, and acceptance leg 
 hold it: the release now proves that exit path the same way it proves the listener one, instead of
 asserting it.
 
+The second round reviewed the tree with F7 in it and returned a blocking verdict on F8, the TLS
+load and renewal paths. It was right, including about the reason it had gone unnoticed: the
+acceptance config served plain HTTP throughout, so section 6's table claimed a defect class it did
+not actually cover for TLS. F8 is fixed and acceptance leg M closes that hole. The same round also
+noted that the new S3 error branch put a raw object-store error into the response body, bypassing
+the conversion this ledger vetted for credential safety; the cause now goes to the log and the
+client gets a message without it.
+
+The pattern across both rounds is worth naming: each time, the review found a place where this
+ledger claimed more completeness than the code had. That is the failure mode a release document
+invites, and it is why the review reads the ledger as well as the diff.
+
 Two earlier review attempts are part of the record because both failed in ways worth keeping:
 
 - The first refused to run at all (`Unsupported event type: push`), which is why the review lives
@@ -320,7 +345,7 @@ Two earlier review attempts are part of the record because both failed in ways w
 
 ## 10. Upstream return path and maintenance
 
-F1 through F4 and F7 are defects in upstream `v0.36.2` and are candidates for upstream pull requests
+F1 through F4, F7 and F8 are defects in upstream `v0.36.2` and are candidates for upstream pull requests
 against upstream's development line, where the same code paths are unchanged. That is a separate
 piece of work in the upstream repository and nothing in this release touches it.
 

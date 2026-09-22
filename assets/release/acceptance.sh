@@ -522,19 +522,23 @@ else
   RC=$?
   [ "$RC" -ne 0 ] && [ "$RC" -ne 134 ] && [ "$RC" -ne 124 ]
   assert "an upgrade without the cache procedure is refused, not aborted" $? "exit code was $RC"
-  grep -q "logs_cache" "$J/rauthy.log"
-  assert "the refusal names the cache log directory" $? "$(tail -3 "$J/rauthy.log")"
+  grep -q "logs_cache" "$J/rauthy.log" && grep -q "HQL_CACHE_LEGACY_MOVE_ASIDE=true" "$J/rauthy.log" \
+    && grep -q "Nothing was changed" "$J/rauthy.log"
+  assert "the refusal names the cache log, the opt-in, and that nothing changed" $? \
+    "$(tail -3 "$J/rauthy.log")"
   diff -r "$J/data/state_machine" "$J/data-as-upstream-left-it/state_machine" > /dev/null \
     && diff -r "$J/data/logs" "$J/data-as-upstream-left-it/logs" > /dev/null
   assert "the refused upgrade changed nothing in the database or its log" $?
 
-  # The procedure: move the cache raft's log and snapshots aside. Nothing is deleted.
+  # The procedure, through Hiqlite's supported opt-in for the one upgrade start: it moves the
+  # cache raft's log and snapshots into pre-upgrade-<unix seconds>/ and deletes nothing.
   mv "$J/rauthy.log" "$J/refused-upgrade.log"
-  mkdir -p "$J/data/pre-upgrade"
-  mv "$J/data/logs_cache" "$J/data/state_machine_cache" "$J/data/pre-upgrade/"
-  start_node "$J" 8099 8109 8209
+  start_node "$J" 8099 8109 8209 HQL_CACHE_LEGACY_MOVE_ASIDE=true
   wait_ready "$J" 8099 300
   assert "the patched build starts on the upstream data directory" $? "see $J/rauthy.log"
+  MOVED="$(find "$J/data" -maxdepth 1 -type d -name 'pre-upgrade-*' | head -1)"
+  [ -n "$MOVED" ] && [ -d "$MOVED/logs_cache" ] && [ -d "$MOVED/state_machine_cache" ]
+  assert "the legacy cache was moved aside, not deleted" $? "$(ls "$J/data")"
   [ "$(jwks_kid 8099)" = "$KID_UP" ]
   assert "the upgrade keeps the signing key" $? "before: $KID_UP after: $(jwks_kid 8099)"
   [ "$(unclean_markers "$J")" = "0" ]
@@ -546,6 +550,13 @@ else
   assert "data written by the upstream baseline survives the upgrade" $?
   [ "$(create_group 8099 acceptance_written_by_patched)" = "200" ]
   assert "the upgraded instance accepts writes" $?
+  stop_node "$J"
+  sleep 3
+  # The opt-in is for one start. Every later start runs without it.
+  mv "$J/rauthy.log" "$J/upgrade-run.log"
+  start_node "$J" 8099 8109 8209
+  wait_ready "$J" 8099 300
+  assert "the upgraded node restarts without the opt-in" $? "see $J/rauthy.log"
   stop_node "$J"
   sleep 3
 

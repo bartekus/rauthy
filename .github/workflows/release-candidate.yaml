@@ -382,6 +382,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: rauthy-amd64
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: consumer
 
       - name: Build the image from the candidate bytes
         run: |

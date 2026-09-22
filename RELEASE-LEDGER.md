@@ -70,7 +70,7 @@ row says otherwise.
 
 | # | What | Why it is here |
 |---|---|---|
-| F5 | `zzd_handler_clients::test_clients` compared a global client count while neighbours in the same binary created and deleted clients. | Test defect; failed the suite on an unrelated schedule. |
+| F5 | `zzd_handler_clients::test_clients` compared a global client count while neighbours in the same binary created and deleted clients. | Test defect. PR #2's repair kept one global check (every client present at the start is present at the end), which the neighbours still broke in CI run `35770325131` by deleting their own clients. The file's tests are now serialized, which is what that check assumed. |
 | F6 | The device grant (RFC 8628) had no test, and Rahi drives it for native clients. `test_device_code_flow` covers it. | Coverage gap; the flow needed no fix. |
 | F14 | **New.** All four `handler_users` tests log in as the one shared user, and every login path saves the whole user row it read. Run concurrently, a login saved a stale copy over `test_user_picture`'s new `picture_id`, which then failed with `400`. Observed in CI on both backends in one run, not in twelve local runs. The tests are now serialized. | Test defect. The lost update underneath it is upstream product behaviour and is **not** changed; see 3.5. |
 

@@ -63,7 +63,7 @@ only requires a `@sha256:` pin, so the namespace change passes its gate unchange
 ARG RAUTHY_IMAGE=ghcr.io/sebadob/rauthy:0.36.2@sha256:f7d3c501402165e023edbd958b032b41c9cfdac5ea7f8ca7d62217327145577e
 ```
 
-become, with the index digest from the table above:
+become, with the index digest that `RELEASE-PROVENANCE.md` records on the release:
 
 ```dockerfile
 ARG RAUTHY_IMAGE=ghcr.io/bartekus/rauthy-patched:0.36.2-patched.1@sha256:<index-digest>

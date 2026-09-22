@@ -228,6 +228,19 @@ assert "a malformed config file fails the start" $?
 grep -qiE 'toml|parse|expected' "$C/malformed.log"
 assert "the malformed-config failure names the problem" $? "$(tail -3 "$C/malformed.log")"
 
+# A cron expression the schedulers would only choke on after the storage layer is live. It has to
+# be refused during config validation, which runs before `DB::init()`.
+CRON="$C/bad-cron"; mkdir -p "$CRON"; cp "$CONFIG_TEMPLATE" "$CRON/config.toml"
+run_until_exit "$CRON" 8085 8115 8215 120 "JWK_AUTOROTATE_CRON=not a cron expression"
+RC=$?
+[ "$RC" -ne 0 ]
+assert "an invalid cron expression fails the start" $? "exit code was $RC"
+grep -qi 'jwk_autorotate_cron' "$CRON/rauthy.log"
+assert "the invalid-cron failure names the setting" $? "$(tail -3 "$CRON/rauthy.log")"
+[ ! -d "$CRON/data/state_machine" ]
+assert "the invalid cron was caught before the storage layer started" $? \
+  "a data directory was created at $CRON/data"
+
 # Conflicting: Postgres selected as the backend, with no Postgres to connect to.
 CONF="$C/conflicting"; mkdir -p "$CONF"; cp "$CONFIG_TEMPLATE" "$CONF/config.toml"
 run_until_exit "$CONF" 8092 8102 8202 180 HIQLITE=false PG_HOST=127.0.0.1 PG_PORT=1 \

@@ -3574,6 +3574,25 @@ impl Vars {
     }
 
     pub fn validate(&self) {
+        // The schedulers parse these with `Schedule::from_str(..).unwrap()`, and they are
+        // spawned after the storage layer is live. A typo there would abort the process with the
+        // WAL lock still held, so it is caught here instead, before `DB::init()` runs and while
+        // the message can still name the setting the operator got wrong.
+        for (key, expr) in [
+            (
+                "lifetimes.jwk_autorotate_cron",
+                self.lifetimes.jwk_autorotate_cron.as_ref(),
+            ),
+            (
+                "geo.maxmind_update_cron",
+                self.geo.maxmind_update_cron.as_ref(),
+            ),
+        ] {
+            if let Err(err) = cron::Schedule::from_str(expr) {
+                panic!("`{key}` is not a valid cron expression: '{expr}': {err}");
+            }
+        }
+
         if !self.database.hiqlite
             && (self.database.pg_host.is_none()
                 || self.database.pg_user.is_none()

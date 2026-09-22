@@ -59,6 +59,7 @@ each has a test that fails without it. Nothing else from the fork's other branch
 | F3 | `GET /auth/v1/ready` answered `200` unconditionally. | It is the documented readiness probe for Kubernetes and Docker. An orchestrator kept routing to a node whose storage was unreachable. It now answers `503` on the health watcher's confirmed verdict, debounced through the watcher's existing re-check so a leader change does not flap a node out of service. |
 | F4 | A config file that could not be read was replaced by an empty config with only a `warn!`. | A mistyped `--config-file` surfaced as "Missing `encryption.keys`", which sends an operator to the wrong place. Configuring entirely through environment variables stays supported: an absent file at the *default* path is still only a warning. A path the operator named, or a file that exists and cannot be read, is now a startup failure that names itself. |
 | F5 | `zzd_handler_clients::test_clients` compared a global client count across its body while its neighbours in the same test binary created and deleted clients concurrently. | A test defect, repaired rather than tolerated: it made the suite fail on an unrelated schedule. It now asserts about the clients it owns. |
+| F9 | The JWK-rotation and MaxMind-update schedulers parsed operator-supplied cron expressions with `Schedule::from_str(..).unwrap()`, and they are spawned after the storage layer is live. | Found by sweeping the class myself rather than waiting for a third review round to find it. A typo in `lifetimes.jwk_autorotate_cron` or `geo.maxmind_update_cron` aborted a process that already owned the data directory. Both expressions are now validated in `Vars::validate()`, which runs before `DB::init()`, so the failure happens while nothing is at stake and the message names the setting. Fixing it at the config layer rather than in the schedulers is deliberate: it fails early instead of after a full bootstrap, and it matches F4. |
 | F8 | `load_tls()` and the self-signed certificate renewal task panicked in four places reached after `DB::init()`, and `tls_hot_reload::load_server_config` panics internally on material it cannot use. | Found by the second review round, which was right that this is the same defect class as F2 and F7 and that no leg exercised it: every scenario ran over plain HTTP. It is reachable in an ordinary production configuration, because rauthy falls back to generating self-signed material whenever the configured `cert_path`/`key_path` are simply missing, and the renewal task carries the panic into a long-running background task that can abort a healthy, serving node hours later. `load_tls()` is now fallible and its error reaches `run()`; the key and certificate are read and parsed before the hot-reload library sees them, which turns the reachable failures into errors instead of a panic inside a dependency; and the renewal task reports and retries instead of panicking, because an unrenewable certificate is survivable and an aborted node with a live storage layer is not. |
 | F7 | `server_with_metrics()` still panicked in five places reached after `DB::init()`: two metrics-builder `unwrap`s, a `panic!` on a malformed `metrics_addr`, the metrics listener's `bind().unwrap()`, and the `block_on().unwrap()` around its run loop. | Found by the independent review, which correctly read this as a counterexample to F2's own claim of completeness rather than a separate issue. Under `panic = "abort"` these abort the process from any thread with no cleanup, so with `metrics_enable = true` a taken metrics port cost the next start its state machine, exactly the failure F2 exists to close. The configuration is now validated and the metrics port bound in the async function, where a failure is an error `run()` can act on, and only an already-bound listener is handed to the thread. The run loop's own failure is logged rather than fatal: metrics are opt-in and auxiliary, and losing them does not justify aborting an identity provider, least of all in the one way that skips the storage shutdown. |
 | F6 | The device grant (RFC 8628) had no test. The well-known document advertised the endpoint and nothing exercised it. | A coverage gap, not a code defect: the consumer drives this flow for its native clients, so the release could not claim it without a test. `test_device_code_flow` now covers the grant request, a poll before approval (`authorization_pending`), an unknown device code, the approval through an authenticated session, and the token set. No product change was needed; the flow works. |
@@ -94,6 +95,28 @@ key that exist but are not usable.
 | Exit code | **134** (`SIGABRT`) | 1 |
 | `Shutdown complete` during that start | **0** | 3 |
 | Last line of output | a panic backtrace note | `The TLS key <path> is not a usable PEM private key: no items found` |
+
+### The rest of the class, swept
+
+After two review rounds each found one more post-`DB::init()` panic, the remaining sites were
+enumerated rather than left to a third round.
+
+- `server.rs` and `tls.rs` have none left.
+- `init_static_vars.rs`, `logging.rs` and `main.rs` panic in several places, and all of them run
+  *before* `DB::init()` (lines 67 and 89 against 112 in `run()`), so nothing is at stake.
+- `utils/stdin.rs` and `utils/gen_config.rs` belong to the `generate-config` and `hash-password`
+  subcommands, which never start the storage layer.
+- In the schedulers, which are the long-running tasks and therefore the F8 shape, two sites took
+  operator-supplied cron expressions: those are F9. The rest are infallible by construction and
+  were left alone: `Schedule::from_str` on hardcoded literals, `Version::parse(RAUTHY_VERSION)` on
+  a compile-time constant that a unit test already parses, `get(pos)` immediately after
+  `position()` returned `Some`, and `last()` immediately after `push()` (including the one at
+  `backchannel_logout.rs:104`, where the `debug_assert!` above it documents exactly that).
+
+The one remaining known hole is inside a dependency: `tls_hot_reload::load_server_config` panics
+on material it cannot use, and a call site cannot catch that under `panic = "abort"`. F8's
+pre-flight parse closes the reachable inputs; material that parses and is then rejected deeper
+inside the library would still abort.
 
 ### Contracts traced that needed no change
 
@@ -172,7 +195,7 @@ not a rebuild of it.
 | Requirement | Test | Covers |
 |---|---|---|
 | First boot, valid config | acceptance A, B | identity, readiness, health, JWKS |
-| Missing / malformed / conflicting config | acceptance C | F4 |
+| Missing / malformed / conflicting config | acceptance C | F4, and F9: an invalid cron is refused before the storage layer starts at all |
 | Listener bind failure with complete cleanup | acceptance D | F2 |
 | Two processes, one data directory | acceptance E | ownership refusal, first node unharmed |
 | Shutdown, restart, storage recovery | acceptance F | F2, signing-key continuity |
@@ -345,7 +368,7 @@ Two earlier review attempts are part of the record because both failed in ways w
 
 ## 10. Upstream return path and maintenance
 
-F1 through F4, F7 and F8 are defects in upstream `v0.36.2` and are candidates for upstream pull requests
+F1 through F4 and F7 through F9 are defects in upstream `v0.36.2` and are candidates for upstream pull requests
 against upstream's development line, where the same code paths are unchanged. That is a separate
 piece of work in the upstream repository and nothing in this release touches it.
 

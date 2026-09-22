@@ -165,7 +165,10 @@ covered); N = 3 (not attempted, not claimed); bit-for-bit reproducibility (not c
    now errors rather than process aborts. The renewal one matters most: it ran in a background
    task and could abort a healthy, serving node hours after startup. Found by the independent
    review.
-7. A shared-state defect in upstream's own client handler test.
+7. An invalid cron expression in `lifetimes.jwk_autorotate_cron` or `geo.maxmind_update_cron` is
+   now refused during config validation, before the storage layer starts, instead of aborting a
+   node that already owns its data directory.
+8. A shared-state defect in upstream's own client handler test.
 
 And one coverage gap closed without a product change: the device grant (RFC 8628) had no test in
 rauthy's own suite, although `rahi` drives it for native clients. `test_device_code_flow` now

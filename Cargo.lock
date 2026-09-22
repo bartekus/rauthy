@@ -5070,6 +5070,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "constant_time_eq",
+ "cron",
  "cryptr",
  "deadpool 0.12.3",
  "deadpool-postgres",

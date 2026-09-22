@@ -4,422 +4,344 @@ A downstream patched distribution of Rauthy. **Not an upstream release**, not en
 supported by the upstream project. Upstream's sources, licence and authorship are carried
 unchanged apart from the commits listed below.
 
+This file states facts that were measured, and says where a value does not exist yet. Section 7
+is the publication state; it is the section to read first.
+
 ## 1. Candidate identity
 
 | | |
 |---|---|
-| Version | `0.36.2-patched.1` |
+| Version | `0.36.2-patched.1` (no release or tag of this version has ever been published, so the number is not reused) |
 | Upstream base | `v0.36.2` = `dd61ac3c84d6b238108dc8438b53043b5177a662` |
-| Source | https://github.com/bartekus/rauthy, branch `release/0.36.2-patched.1` |
-| Release line | `patched/0.36.2` |
+| Source | https://github.com/bartekus/rauthy, work branch `release/0.36.2-patched.1-hiqlite` |
+| Release line | `patched/0.36.2` (first merge: PR #2 at `119131b2`, against upstream `hiqlite 0.14.0`) |
 | Image | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.1` |
 | Binary path in image | `/app/rauthy` (unchanged) |
 | Executable name | `rauthy` (unchanged) |
+| Storage dependency | `hiqlite-patched`, `hiqlite-wal-patched`, `hiqlite-derive-patched` `0.15.0-patched.1` |
 | Supported topology | N = 1 |
-| Publication status | **held** - see section 7 |
+| Publication status | **held**: the Hiqlite packages are not on crates.io. Section 7 |
 
 `patched.1` sits in the SemVer pre-release field because that is the only field a valid SemVer can
 carry it in and still parse, order and satisfy rauthy's own `semver` checks. The consequence is
 that `0.36.2-patched.1` orders *below* `0.36.2`; section 5 records what that does and does not
 affect. An OCI tag cannot contain `+`, so build metadata was not an option.
 
+**What changed since PR #2.** PR #2 qualified the repairs against upstream `hiqlite 0.14.0`,
+because the patched packages did not exist. Nothing it measured covers the patched Hiqlite: the
+dependency changed, so every earlier acceptance result is historical evidence only. This ledger
+carries the integration, the repairs it forced, and the evidence taken against the patched graph.
+
 ## 2. Why this baseline
 
-The choice was between a minimal patch on the consumer's supported upstream release (`v0.36.2`)
-and adopting upstream's development line (`main`, `0.37.0-20260917`). The evidence:
+Unchanged from PR #2. The consumer (`rahi`) runs upstream `v0.36.2`, pinned by digest; upstream's
+development line (`0.37.0-*`) carries config renames and an SMTP rework the consumer does not need
+and depends on an unreleased Hiqlite API. `v0.36.2` plus the fixes below is the smallest change
+set that consumes the repaired Hiqlite.
 
-- **The consumer already runs `v0.36.2`.** `rahi`'s `docker/Dockerfile` pins
-  `ghcr.io/sebadob/rauthy:0.36.2` by digest and copies `/app/rauthy` out of it.
-- **The development line carries breaking changes this release does not need.** Its unreleased
-  changelog renames config values (`GEO_BLOCK_UNKONW`, `pasword_argon2id`) and reworks SMTP
-  (`email.starttls_only` and `email.danger_insecure` removed, `email.smtp_tls_mode` added). None of
-  that is required to consume a repaired Hiqlite.
-- **The development line requires an unreleased Hiqlite API.** `main` pins hiqlite to a git commit
-  and uses `get_remove()` / `get_remove_bytes()`, which the published `hiqlite 0.14.0` does not
-  have. `v0.36.2` resolves `hiqlite 0.14.0` from crates.io and uses only its released surface.
-- **The repairs backport with no source change.** A `cargo check --workspace --all-targets` of
-  `v0.36.2` against the repaired Hiqlite line (`bartekus/hiqlite`, branch `spec-spine`, which is
-  based on Hiqlite upstream `main`) compiles clean. The repairs there are behavioural, not API:
-  the only public additions are `hiqlite_wal::AppendCompletion` and `Error::as_io_error`, neither
-  of which Rauthy calls. Rauthy talks to `hiqlite::Client`, which is untouched.
+The patched Hiqlite's own baseline is upstream `v0.14.0` plus 19 commits. Its public API changed
+(new error variants, `Client::node_failure`, bounded health waits, `ServerTlsConfig::from_env`
+returns a `Result`), which is why it is `0.15.0-patched.1`. Rauthy `v0.36.2` compiles against it
+**with no source change**; the changes below are behavioural adaptations, not compile fixes.
 
-So the smallest maintainable change set that can consume the repaired Hiqlite is `v0.36.2` plus
-the fixes in section 3. Taking `main` would have imported a config migration for the consumer in
-exchange for nothing.
+## 3. Included changes
 
-## 3. Included fixes
+Each product change was found by tracing a storage contract through Rauthy's caller or by a run
+that failed, and each has an assertion that was observed failing without it, except where the
+row says otherwise.
 
-Each is source-established: it was found by tracing a storage contract through Rauthy's caller, and
-each has a test that fails without it. Nothing else from the fork's other branches is included.
+### 3.1 Defects in upstream v0.36.2 (runtime behaviour)
 
-| # | Defect | Why it is in this release |
+| # | Defect | Evidence it is real |
 |---|---|---|
-| F1 | `GET /auth/v1/backup/local/{file}` and `/backup/s3/{object}` ended the response body on a read error exactly as on EOF, under an already-sent `200`. | The consumer's backup verb takes rauthy's snapshot through these routes and checks only the status and a non-empty body, so a truncated SQLite file was sealed into an archive as a good backup. Both routes now fail the stream instead of ending it, and the local route additionally serves a `Content-Length`, so a short body is detectable by any HTTP client on its own terms rather than only through the server dropping the connection. The S3 route has no length to declare, because it proxies a stream whose size it does not know in advance; there, the stream error is the whole guarantee. |
-| F2 | Any error return after `DB::init()` skipped `DB::hql().shutdown()`. A listener that could not bind returned straight out of `run()`. | The WAL lock stayed held and the state-machine lock file stayed in place, so the next start read the directory as an ungraceful shutdown. With hiqlite's default `auto-heal` feature, which Rauthy enables, that rebuilds the state machine from the raft log. The post-init `expect`/`unwrap` calls became errors for the same reason: `panic = "abort"` runs no cleanup. |
-| F3 | `GET /auth/v1/ready` answered `200` unconditionally. | It is the documented readiness probe for Kubernetes and Docker. An orchestrator kept routing to a node whose storage was unreachable. It now answers `503` on the health watcher's confirmed verdict, debounced through the watcher's existing re-check so a leader change does not flap a node out of service. |
-| F4 | A config file that could not be read was replaced by an empty config with only a `warn!`. | A mistyped `--config-file` surfaced as "Missing `encryption.keys`", which sends an operator to the wrong place. Configuring entirely through environment variables stays supported: an absent file at the *default* path is still only a warning. A path the operator named, or a file that exists and cannot be read, is now a startup failure that names itself. |
-| F5 | `zzd_handler_clients::test_clients` compared a global client count across its body while its neighbours in the same test binary created and deleted clients concurrently. | A test defect, repaired rather than tolerated: it made the suite fail on an unrelated schedule. It now asserts about the clients it owns. |
-| F9 | The JWK-rotation and MaxMind-update schedulers parsed operator-supplied cron expressions with `Schedule::from_str(..).unwrap()`, and they are spawned after the storage layer is live. | Found by sweeping the class myself rather than waiting for a third review round to find it. A typo in `lifetimes.jwk_autorotate_cron` or `geo.maxmind_update_cron` aborted a process that already owned the data directory. Both expressions are now validated in `Vars::validate()`, which runs before `DB::init()`, so the failure happens while nothing is at stake and the message names the setting. Fixing it at the config layer rather than in the schedulers is deliberate: it fails early instead of after a full bootstrap, and it matches F4. |
-| F8 | `load_tls()` and the self-signed certificate renewal task panicked in four places reached after `DB::init()`, and `tls_hot_reload::load_server_config` panics internally on material it cannot use. | Found by the second review round, which was right that this is the same defect class as F2 and F7 and that no leg exercised it: every scenario ran over plain HTTP. It is reachable in an ordinary production configuration, because rauthy falls back to generating self-signed material whenever the configured `cert_path`/`key_path` are simply missing, and the renewal task carries the panic into a long-running background task that can abort a healthy, serving node hours later. `load_tls()` is now fallible and its error reaches `run()`; the key and certificate are read and parsed before the hot-reload library sees them, which turns the reachable failures into errors instead of a panic inside a dependency; and the renewal task reports and retries instead of panicking, because an unrenewable certificate is survivable and an aborted node with a live storage layer is not. |
-| F7 | `server_with_metrics()` still panicked in five places reached after `DB::init()`: two metrics-builder `unwrap`s, a `panic!` on a malformed `metrics_addr`, the metrics listener's `bind().unwrap()`, and the `block_on().unwrap()` around its run loop. | Found by the independent review, which correctly read this as a counterexample to F2's own claim of completeness rather than a separate issue. Under `panic = "abort"` these abort the process from any thread with no cleanup, so with `metrics_enable = true` a taken metrics port cost the next start its state machine, exactly the failure F2 exists to close. The configuration is now validated and the metrics port bound in the async function, where a failure is an error `run()` can act on, and only an already-bound listener is handed to the thread. The run loop's own failure is logged rather than fatal: metrics are opt-in and auxiliary, and losing them does not justify aborting an identity provider, least of all in the one way that skips the storage shutdown. |
-| F6 | The device grant (RFC 8628) had no test. The well-known document advertised the endpoint and nothing exercised it. | A coverage gap, not a code defect: the consumer drives this flow for its native clients, so the release could not claim it without a test. `test_device_code_flow` now covers the grant request, a poll before approval (`authorization_pending`), an unknown device code, the approval through an authenticated session, and the token set. No product change was needed; the flow works. |
+| F1 | `GET /auth/v1/backup/local/{file}` and `/backup/s3/{object}` ended the response body on a read error exactly as on EOF, under an already-sent `200`. Both now fail the stream; the local route also serves a `Content-Length` and treats it as a bound in both directions. | `api::backup::tests`; `handler_generic::test_backup_download_is_complete` |
+| F2 | An error return after `DB::init()` skipped the storage shutdown (a listener that could not bind returned straight out of `run()`), so the next start rebuilt the state machine. | Measured against the upstream binary: 0 shutdowns and 3 unclean markers upstream, 3 shutdowns and 0 markers patched. Acceptance D |
+| F3 | `GET /auth/v1/ready` answered `200` unconditionally. | Acceptance K (Postgres) and P (Hiqlite) |
+| F4 | An unreadable config file became an empty config with a warning. | Acceptance C |
+| F7 | Five `panic = "abort"` sites in `server_with_metrics()` reached after `DB::init()`. | Acceptance L |
+| F8 | Four more in TLS load and self-signed renewal; the renewal task could abort a serving node. | Measured against the upstream binary: exit 134 upstream, exit 1 with 3 shutdowns patched. Acceptance M |
+| F9 | The JWK-rotation and MaxMind schedulers `unwrap()`ed operator-supplied cron expressions after the storage layer was live. | Acceptance C |
+| F10 | **New.** `DB::init()` itself: when connecting to Postgres, waiting for a healthy Raft, or reading the membership failed after `hiqlite::start_node_with_cache()` had returned a running node, the client was dropped unstopped. F2 did not cover it, because `run()` only shuts down a client that was stored. The `PG_*` `expect()`s ran in the same window. | Acceptance C, "a backend failure inside DB::init shut the embedded storage down": observed failing with the fix reverted |
+| F11 | **New, found by the integration.** `/ready` answered from the health watcher's debounced sample, so after a terminal storage failure it kept answering `200` for up to 90 s. It now also consults `Client::node_failure()` and answers `503` at once. | Acceptance P, "readiness reports the embedded storage failure within seconds": observed failing (`200`) with the fix reverted |
+| F12 | **New, found by the integration.** The IP-blacklist middleware looks every client up in the cache ahead of every handler. On a failed node that lookup is refused, so the probes answered `500` from the middleware and `/ready`'s `503` never ran. When that lookup fails on one of the three probe paths only, the request proceeds; a blacklisted client is still refused whenever the lookup succeeds. | Acceptance P on the `d45826cd` tree answered `500`; `503` after the fix |
+| F13 | **New.** `hiqlite::Error::NodeFailed` carries an account naming internal components and file paths, and fell through to a catch-all that put it in the response body. The account now goes to the log; the client gets "The storage layer of this node is out of service". | Acceptance P, "the refusal does not expose the storage path to the client" (meaningful only on a Hiqlite tree that refuses reads, see 3.4) |
+
+### 3.2 Test defects and coverage gaps (no product change)
+
+| # | What | Why it is here |
+|---|---|---|
+| F5 | `zzd_handler_clients::test_clients` compared a global client count while neighbours in the same binary created and deleted clients. | Test defect; failed the suite on an unrelated schedule. |
+| F6 | The device grant (RFC 8628) had no test, and Rahi drives it for native clients. `test_device_code_flow` covers it. | Coverage gap; the flow needed no fix. |
+| F14 | **New.** All four `handler_users` tests log in as the one shared user, and every login path saves the whole user row it read. Run concurrently, a login saved a stale copy over `test_user_picture`'s new `picture_id`, which then failed with `400`. Observed in CI on both backends in one run, not in twelve local runs. The tests are now serialized. | Test defect. The lost update underneath it is upstream product behaviour and is **not** changed; see 3.5. |
+
+### 3.3 Release engineering
+
+- **The publish workflow trusted the run id it was given.** It checked the binaries against
+  checksums from the same artifact, so any green run with matching artifact names, including a
+  rerun that turned a red job green, would have been promoted. Its graph guard only asked whether
+  each `hiqlite*` package came from a registry, so upstream's `hiqlite 0.14.0` passed it: PR #2's
+  candidate could have been published on the graph it was meant to replace. Section 8.
+- **Upstream's `code_style.yaml` declared no `permissions`,** so on this fork (default `write`) a
+  pull-request job held a token that could push. It now declares `contents: read`.
+- **The image ships `LICENSE`.** Apache-2.0 requires a copy with every redistribution.
 
 Downstream identity, not a defect fix: the version marker, the startup log line naming distributor
 and upstream base, the `patched.N` marker being recognised instead of warned about as an upstream
 pre-release, and the image labels.
 
-### F2, measured against the upstream binary
+### 3.4 Found in the patched Hiqlite by this integration, repaired there
 
-The same scenario, run twice in the same container image, once with upstream's own `v0.36.2`
-binary taken out of `ghcr.io/sebadob/rauthy:0.36.2` and once with this release's `linux/arm64`
-artefact. The port is occupied first, so the listener cannot bind; the node is then started again
-normally on the same data directory.
+Reported to the Hiqlite release owner with evidence; repaired in `bartekus/hiqlite`, not here.
 
-| | upstream `v0.36.2` | `0.36.2-patched.1` |
-|---|---|---|
-| Exit code of the failed start | 1 | 1 |
-| `Shutdown complete` during that start | **0** | 3 |
-| Unclean-shutdown markers on the next start | **3** | 0 |
+- **F-110.** `Client::ensure_node_available()` was documented as guarding "every local
+  operation" and was called only by the health checks and the network API. Found by a
+  negative-control run: with Rauthy's `NodeFailed` mapping reverted, the path-leak assertion still
+  passed, because a failed node's writes were refused by openraft's own fatal error and reads were
+  not refused at all. Repaired: writes, queries, cache operations, locks and listen now refuse with
+  `NodeFailed`.
+- **Upgrade abort.** Started on a data directory upstream `v0.36.2` left behind, the patched build
+  exited `134` (`SIGABRT`) on both architectures (CI run `35764291279`, leg J; reproduced in a
+  Linux container). Root cause, per the Hiqlite owner: the replicated cache command layout changed
+  after `hiqlite 0.14.0` (upstream PR #362), so a 0.14 cache raft log is unreadable by any later
+  build, and some entries decode as the *wrong* command; the start then failed, the teardown
+  dropped the WAL reader's receiver, and `reader.rs` `unwrap()`ed the send, hiding the error behind
+  an abort. Repaired as a contract (section 5): the cache raft is not carried across the upgrade,
+  a legacy cache is refused with an error that changes nothing, `HQL_CACHE_LEGACY_MOVE_ASIDE=true`
+  moves it aside, and the reader no longer panics.
 
-Upstream's third marker is `Node did not shut down gracefully - auto-rebuilding State Machine`: a
-failed bind costs it the state machine, which is then rebuilt from the raft log. This is the
-defect, not an inference about it.
+### 3.5 Known upstream defects, not changed here
 
-### F8, measured against the upstream binary
-
-The same shape as F2, run in the same container image, with `scheme = https` and a certificate and
-key that exist but are not usable.
-
-| | upstream `v0.36.2` | `0.36.2-patched.1` |
-|---|---|---|
-| Exit code | **134** (`SIGABRT`) | 1 |
-| `Shutdown complete` during that start | **0** | 3 |
-| Last line of output | a panic backtrace note | `The TLS key <path> is not a usable PEM private key: no items found` |
-
-### The rest of the class, in the startup and scheduler paths
-
-After two review rounds each found one more post-`DB::init()` panic, the remaining sites in the
-paths those two findings came from were enumerated rather than left to a third round.
-
-The scope of that enumeration matters, and the fourth review round was right to push on how it
-was first worded here. `panic = "abort"` is a workspace-wide profile setting, so *any* panic
-anywhere aborts without running the shutdown, including one inside a request handler on a live
-node. What follows covers the startup path and the long-running background tasks, which is where
-F2, F7 and F8 lived. It does not cover the per-request surface in `src/api`, `src/service` and
-`src/data`. That surface carries the same exposure in upstream `v0.36.2`, unchanged by this
-release, and a spot check of it during review found the `unwrap`s guarded; auditing it in full is
-a larger piece of work than this release, and it is listed as an unresolved limitation rather than
-quietly implied to be done.
-
-- `server.rs` and `tls.rs` have none left.
-- `init_static_vars.rs`, `logging.rs` and `main.rs` panic in several places, and all of them run
-  *before* `DB::init()` (lines 67 and 89 against 112 in `run()`), so nothing is at stake.
-- `utils/stdin.rs` and `utils/gen_config.rs` belong to the `generate-config` and `hash-password`
-  subcommands, which never start the storage layer.
-- In the schedulers, which are the long-running tasks and therefore the F8 shape, two sites took
-  operator-supplied cron expressions: those are F9. The rest are infallible by construction and
-  were left alone: `Schedule::from_str` on hardcoded literals, `Version::parse(RAUTHY_VERSION)` on
-  a compile-time constant that a unit test already parses, `get(pos)` immediately after
-  `position()` returned `Some`, and `last()` immediately after `push()` (including the one at
-  `backchannel_logout.rs:104`, where the `debug_assert!` above it documents exactly that).
-
-The one remaining known hole is inside a dependency: `tls_hot_reload::load_server_config` panics
-on material it cannot use, and a call site cannot catch that under `panic = "abort"`. F8's
-pre-flight parse closes the reachable inputs; material that parses and is then rejected deeper
-inside the library would still abort.
+- **Lost update on the user row.** The picture upload and every login path (`authorize`, password
+  grant, WebAuthn, upstream providers) read the user and save the whole row. A login that read the
+  user before a concurrent picture upload saves it back without the picture. Present in upstream
+  `v0.36.2`, unrelated to storage, and outside this release's scope; a candidate for upstream.
+- **The per-request `panic = "abort"` surface** in `src/api`, `src/service` and `src/data` was
+  spot-checked, not audited (unchanged from PR #2).
+- **Config-layer aborts.** Config errors abort the process before `DB::init()`; nothing is at
+  stake, but a supervisor sees an abort, not a clean exit.
 
 ### Contracts traced that needed no change
 
-- **Ownership refusal.** `hiqlite_wal::LogStore::start` takes a real `flock` before
-  `StateMachineSqlite::new` runs, so a second process is refused before it can reach the
-  `auto-heal` path that deletes the state-machine database. Verified with two real processes.
-- **Error conversion.** `From<hiqlite::Error> for ErrorResponse` keeps each variant's `Display`
-  text. No credential reaches it; the acceptance run asserts a failed database start does not echo
-  the password.
-- **Cache, counter, notification and session operations.** The package swap changes no API, so
-  these are covered by the existing integration suite on both backends.
+- **Ownership refusal.** The patched Hiqlite takes an OS advisory lock on the data directory before
+  anything touches it, and a second process is refused with `StorageInUse: ... owned by another
+  live process ... has changed nothing`. Acceptance E and R, two real processes.
+- **Restore ownership.** `HQL_BACKUP_RESTORE` is processed after the ownership lock
+  (`start.rs:252` before `:267` in the traced tree), so a restore aimed at a directory a live node
+  owns is refused before any restore step. Acceptance R.
+- **Shutdown.** `Client::shutdown()` is bounded at 15 s and now returns the sequence's own result;
+  both Rauthy call sites already log an `Err` and exit non-zero. At N = 1 the whole storage
+  shutdown takes about 30 ms (measured), so the 9.5 s multi-node delay does not apply.
+- **F-107** (Hiqlite): `membership_change_allowed` refuses a node that is shutting down, has no
+  leader, is not the leader, or is the leader but not a voter, each as `LeaderChange` (`409`), and
+  in the final tree runs under the same gate as the shutdown. Not reachable at N = 1.
+- **Consumer-read Hiqlite contracts.** The snapshot name `backup_node_<id>_<seconds>.sqlite` and
+  the 60 s duplicate-backup suppression are unchanged from `0.14.0` (source, and acceptance G for
+  the name).
 
-## 4. Dependency readiness
+## 4. Dependency graph
 
-| Package | Wanted | Present in this candidate |
+| Package | Selected | Source in the current candidate |
 |---|---|---|
-| `hiqlite` | `hiqlite-patched`, selected version | `hiqlite 0.14.0`, crates.io, `8711815c093414290a5fcbc0bf74e1e70e3d6ef37e21735000178d25cee6fcf0` |
-| `hiqlite-wal` | `hiqlite-wal-patched`, selected version | `hiqlite-wal 0.14.0`, crates.io, `247fc29e082f38fdf25270f6a5d7148284c9710384c3bce21636608dc104fddf` |
-| `hiqlite-derive` | `hiqlite-derive-patched`, selected version | `hiqlite-derive 0.14.0`, crates.io, `262ec752546b183ecab006d9a34e2a0811a7141ad0b575cc68c7ac61f30de53e` |
+| `hiqlite-patched` | `=0.15.0-patched.1` via `hiqlite = { package = "hiqlite-patched", ... }` | git `bartekus/hiqlite` @ `34641b0a4b1d64ff1df24a6bd931c1dc4ff62b61` |
+| `hiqlite-wal-patched` | pulled in by the above | same |
+| `hiqlite-derive-patched` | pulled in by the above | same |
+| `openraft` | `0.9.25` | crates.io, `a97014fb78acb77be3a40ac2da305f6dd3a6b243f3a908ace87d29b3972eaafd` |
 
-The candidate resolves published registry packages only. There is **no** `[patch.crates-io]`
-section, no path dependency and no git dependency in this tree: upstream `v0.36.2` ships that
-section commented out and it stays that way, so nothing can silently keep selecting upstream git.
+The alias keeps the dependency key `hiqlite`, so no `use hiqlite::...` moves and the derive
+macros' absolute `::hiqlite::` paths resolve. `cargo check`, clippy with `-D warnings`, and the
+whole build pass with no Rauthy source change for the swap itself.
 
-The patched packages **are not published**. Checked against the crates.io API and against
-`bartekus/hiqlite`, which has no tags and no releases. Until they exist this release line cannot be
-published: see section 7.
+Against PR #2's lock, the graph changes only in the three Hiqlite packages and in
+`constant_time_eq 0.6.0`, which the patched Hiqlite adds. `openraft` stays at `0.9.25`, the version
+the Hiqlite release was qualified against after its own F-108 (local and CI resolving different
+openraft versions); the published `hiqlite-patched` pins `=0.9.25`.
+
+`assets/release/check_graph.py` is the single definition of a release graph, used by both
+workflows: exactly one copy of each patched package, all from crates.io with a checksum, none of
+upstream's `hiqlite*` packages, one `openraft`. The current git-sourced graph passes its shape
+check and **fails** its release check, which is correct.
 
 ## 5. Compatibility
 
-**API.** No change. Every route, request and response shape is upstream `v0.36.2`, except that
-`/auth/v1/ready` gained a `503` response, which is what a readiness probe is for.
+**API.** No change except that `/auth/v1/ready` can answer `503`, which is what a readiness probe
+is for. The `ErrorResponse` type is unchanged.
 
-**Configuration.** No renames, no removals, no new required values. One behaviour change: a config
-file that cannot be read now fails the start unless it is the default `./config.toml` and simply
-absent. A deployment that passes an explicit `--config-file` pointing at a file that does not exist
-was already broken and now says so.
+**Configuration.** No renames, no removals, no new required values. A config file that cannot be
+read now fails the start unless it is the default `./config.toml` and simply absent.
 
 **Database.** No schema change and no migration. This build stamps `0.36.2-patched.1` into the
 `config` table's `db_version` row.
 
-**Upgrade path.** Upstream `v0.36.2` -> `0.36.2-patched.1`, in place, on the existing data
-directory. No export, no downtime beyond the restart. Exercised end to end against the real
-upstream binary taken from its own published image.
+**Upgrade from upstream v0.36.2, in place.**
 
-**Recovery path.** Unchanged: hiqlite's `HQL_BACKUP_RESTORE` into a fresh data directory. The
-restore keeps the original signing keys, so tokens and sessions issued before the backup remain
-verifiable.
+1. Stop the node.
+2. Swap the image.
+3. Start **once** with `HQL_CACHE_LEGACY_MOVE_ASIDE=true`. Hiqlite moves `logs_cache` and
+   `state_machine_cache` into `{data_dir}/pre-upgrade-<unix seconds>/` (moved, never deleted),
+   writes its format marker, and starts with an empty cache.
+4. Remove the variable. Every later start runs without it.
 
-**Rollback.** Upstream `v0.36.2` starts again on a data directory this build has written.
-`LOWEST_COMPATIBLE_VERSION` in `v0.36.2` is `0.35.0` and `0.36.2-patched.1 > 0.35.0`, so the
-stamped version locks nothing out. Covered by a unit test and by the acceptance run.
+Started without the variable, the node refuses with an error that names both directories, the
+variable and the manual alternative, ends "Nothing was changed.", and exits `1`. That is the
+designed failure, not a crash. With `HQL_CACHE_STORAGE_DISK=false` there is nothing to move.
 
-**Not supported.** Mixed-version deployment of this build with any other Rauthy version in one raft
-cluster. Downgrade to anything below `v0.36.2`. Multi-node topologies: this release is qualified at
-N = 1 only, and single-node results say nothing about N = 3.
+What an empty cache costs: in-flight authorization codes, device codes, WebAuthn challenges, PoW
+challenges, rate-limit counters and IP-blacklist entries. **Sessions are not lost**: Rauthy
+persists them in the `sessions` table and uses the cache only as a read-through. The SQLite
+database, its raft log and the signing keys carry across unchanged.
+
+**Recovery path.** Hiqlite's `HQL_BACKUP_RESTORE` into a fresh data directory, unchanged in use.
+The patched Hiqlite stages the image before replacing anything and refuses a restore into a
+directory a live process owns. The restored instance keeps the original signing keys.
+
+**Rollback to upstream v0.36.2.** Stop the node, move `logs_cache` and `state_machine_cache` out
+of the data directory **by hand**, then start upstream. This step is mandatory: upstream `0.14`
+has no format marker check and could decode a patched cache entry as the wrong command. The
+database, its raft log and everything the patched build wrote are readable by upstream (acceptance
+J; the Hiqlite owner verified both directions separately). `LOWEST_COMPATIBLE_VERSION` in
+`v0.36.2` is `0.35.0`, so the stamped version locks nothing out. Limit: no SQLite *snapshot* was
+written during either check, so snapshot readability across versions rests on source (naming
+unchanged; the patched build keeps two snapshots where `0.14.0` kept one).
+
+**Not supported.** Mixed versions in one raft cluster. Downgrade below `v0.36.2`. Multi-node
+topologies, including a multi-node restore (the patched Hiqlite states N = 1 for restore too).
 
 ## 6. Acceptance matrix
 
-`assets/release/acceptance.sh` runs the process-level legs against the release binary; the cargo
-suites run against a live backend on both database backends. Every repair maps to a test.
+`assets/release/acceptance.sh <rauthy> [<upstream-rauthy>]` runs the process-level legs against a
+release binary. With `ACCEPTANCE_STRICT=1`, which the candidate workflow sets, a skipped leg fails
+the run, and every run writes `acceptance-result.json` for the publish gate. Each scenario has its
+own data directory and ports.
 
-Run it by hand with `assets/release/acceptance.sh <rauthy> [<upstream-rauthy>]`. The second binary
-enables the upgrade and rollback legs and is expected to be the upstream release this build is
-based on, taken out of its own published image; without it those two legs report as skipped rather
-than quietly passing. Each scenario gets its own data directory and its own ports, so a failure
-leaves its logs behind to read.
+| Requirement | Leg / test | Backend | Covers |
+|---|---|---|---|
+| Release identity, version output | A | n/a | `--version`, marker handling |
+| First boot, production frontend | B | Hiqlite | ready, health, JWKS, identity; the served index references a built bundle and the bundle and `/account` are served |
+| Bad configuration, bind failure with cleanup | C, D | both | F4, F9, F10, F2 |
+| Real competing processes | E | Hiqlite | `StorageInUse`, first node unharmed |
+| Normal shutdown, restart | F | Hiqlite | clean exit `0`, no unclean markers, keys survive |
+| Interrupted run, recovery | Q | Hiqlite | SIGKILL under write load; the next start must report the unclean shutdown; acknowledged writes, keys and identity survive; the recovered node shuts down cleanly |
+| Fresh backup, restore, bad restore input | G, `handler_generic::test_backup_download_is_complete`, `api::backup::tests` | Hiqlite | F1; restore with original keys and identity; truncated and missing input refused without loss; snapshot name |
+| Restore into an owned directory | R | Hiqlite | refused before any restore step; owner's data intact in memory and on disk |
+| Live storage failure, Postgres | K | Postgres | the database container is stopped under a live node: `/ready` `503`, `/health` `500` |
+| Live storage failure, embedded Hiqlite | P | Hiqlite | the Raft log directory is made read-only and writes are driven until the WAL writer cannot rotate: `/ready` `503` within seconds, `/health` `500`, writes and reads refused with no storage path in the body, no abort, SIGTERM exit without a kill, recovery with every acknowledged write |
+| Upgrade and rollback against the real baseline | J | Hiqlite | the upstream `v0.36.2` binary from its own image writes data; the raw upgrade is refused and changes nothing; the opt-in upgrade keeps keys, identity and upstream-written data and moves the cache aside; a later start needs no opt-in; the rollback reads patched-written data |
+| TLS and metrics exit paths | M, L | Hiqlite | F8, F7 |
+| Login, session, logout | `handler_auth`, `handler_users`, `handler_sessions` | both | |
+| Native clients, device grant, refresh, revocation, bearer writes | `handler_auth::{test_device_code_flow, test_token_revocation, test_password_flow, test_dpop, test_client_credentials_flow}`, `handler_api_keys` | both | F6 |
+| Audience and scope negative cases | `zzf_handler_resource_indicators`, `zzg_handler_token_exchange`, `handler_scopes` | both | |
+| Passkey-only backup administrator with MFA | consumer job: Rahi's own `rauthy_backup_admin` test inside its whole live suite, `RAHI_REQUIRE_RAUTHY=1` | Hiqlite | the consumer's existing flow, unchanged; nothing invented here |
+| The consumer's whole live suite | consumer job, `statecrafting/rahi` @ `b815b18c` | Hiqlite | an image built from the candidate bytes, run as Rahi's `live.yml` runs its pin |
 
-Result on the candidate's own artefacts: the whole harness passes with **zero failures and zero
-skips** on `linux/amd64` and on `linux/arm64`, each on its own native runner, alongside both
-integration suites and the style checks. Every run prints its own assertion count, which grows as
-legs are added, so the count is read off the run rather than copied here. The upgrade and rollback
-legs run against the real upstream `v0.36.2` binary taken out of `ghcr.io/sebadob/rauthy:0.36.2`,
-not a rebuild of it.
+Every new assertion was checked for the ability to fail: F10's and F11's were observed failing
+with their fixes reverted; F13's was found **unable** to fail on a Hiqlite tree without F-110, was
+removed, and was restored only once F-110 made it observable. Q's first design tried to kill the
+node during its storage shutdown, which at N = 1 lasts about 30 ms; its own "was actually
+interrupted" assertion caught that, and it was redesigned.
 
-| Requirement | Test | Covers |
+### Results
+
+Evidence taken against the git-sourced Hiqlite candidate is scratch evidence: it guided the work
+and cannot qualify publication.
+
+| Tree | Where | Result |
 |---|---|---|
-| First boot, valid config | acceptance A, B | identity, readiness, health, JWKS |
-| Missing / malformed / conflicting config | acceptance C | F4, and F9: an invalid cron is refused before the storage layer starts at all |
-| Listener bind failure with complete cleanup | acceptance D | F2 |
-| Two processes, one data directory | acceptance E | ownership refusal, first node unharmed |
-| Shutdown, restart, storage recovery | acceptance F | F2, signing-key continuity |
-| Login, session, logout, protected routes | `handler_auth`, `handler_users`, `handler_sessions` | both backends |
-| Native public client, refresh timing, revocation, bearer-protected writes | `handler_auth::test_token_revocation`, `test_password_flow`, `test_dpop`, `test_client_credentials_flow`, `handler_api_keys` | both backends |
-| Device grant (RFC 8628), including its negative cases | `handler_auth::test_device_code_flow` | **new in this release**, both backends |
-| Audience and scope enforcement, negative cases | `zzf_handler_resource_indicators`, `zzg_handler_token_exchange`, `handler_scopes` | both backends |
-| Fresh backups, rapid repeated requests | `handler_generic::test_backup_download_is_complete` | F1 end to end: the declared `Content-Length`, the received length, and the listing's size must all agree |
-| Backup read failure reaches the client | `api::backup::tests` | F1 directly, plus the declared length as a bound in both directions |
-| Restore into fresh storage, identity and key continuity | acceptance G | restore correctness |
-| Invalid / truncated / missing restore input | acceptance G | refusal without destroying the last recoverable state |
-| Observable unavailability after storage failure | acceptance K | F3, with real failure injection |
-| Upgrade from the upstream baseline | acceptance J | in-place upgrade and rollback |
-| Release identity and version parsing | acceptance A, `db_version::tests` | `--version`, marker handling, rollback safety |
-| Identity survives restore and upgrade | acceptance B, G, J | the bootstrapped credential authenticates and the original admin is readable, on a first boot, after a restore, and after an upgrade |
-| A metrics listener that cannot start | acceptance L | F7: the failure is an error, not an abort, and the data directory stays clean |
-| Serving HTTPS, with generated and with unusable TLS material | acceptance M | F8: the generated path comes up and serves over TLS; unusable material is an error that names the file, and the data directory stays clean |
+| Hiqlite `c7d0d6a9` | CI run `35764291279`, amd64 and arm64 | 99 passed, 3 failed (J: the upgrade abort, 3.4), 0 skipped; integration suites green on both backends |
+| Hiqlite `d45826cd` | CI run `35767263504`, amd64 and arm64 | 101 passed, 3 failed (J, same cause); integration suites failed on F14 on both backends |
+| Hiqlite `d45826cd` + F12 | local, macOS arm64 | 98 passed, 0 failed, 2 skipped (J needs the Linux upstream binary) |
+| Hiqlite `34641b0a` | CI run `35770325131` | recorded in section 7 when it completes |
 
-### Legs not covered, and why
+The qualifying run is the one section 7 names, on the merge commit, against the published graph.
 
-- **Passkey-only backup administrator with MFA enabled.** This is a consumer-side configuration
-  (`rahi` spec 037): rauthy enforces it through `ADMIN_FORCE_MFA` and the admin-session check on
-  the backup routes, neither of which this release changes. Verifying the flow end to end needs a
-  WebAuthn authenticator and the consumer's own harness. **No rauthy change was made for it**, per
-  the rule that a change needs an actual failing requirement behind it.
-- **Terminal Hiqlite storage failure injected from outside the process.** Acceptance K injects a
-  real storage failure on the Postgres backend, where stopping the database is deterministic. The
-  Hiqlite backend has no equivalent external injection point; that leg lands in Hiqlite's own
-  repaired append-completion path, which is the other session's scope.
-- **A backup download cancelled by the client.** The consumer takes its backups under a deadline
-  and can abandon a download. The code path is there and is the one silent exit `pump_reader`
-  keeps: a send into a closed channel ends the pump, because the client already knows it did not
-  get the file. It is not separately asserted, because provoking a mid-download hang-up through
-  the real handler needs a client that can be made to stop reading at a chosen byte, which this
-  suite has no way to build. The suppression window and the snapshot naming that the consumer's
-  deadline logic actually reads are hiqlite's, not rauthy's; section 7 lists them as things to
-  re-check when the packages are swapped.
-- **N = 3.** Not attempted. Not claimed.
-- **Bit-for-bit reproducibility.** Not claimed and not verified. `src/common/build.rs` stamps
-  `BUILD_TIME` from the wall clock, so two builds of the same tree differ by construction.
+### Limits
+
+- **N = 3** not attempted, not claimed.
+- **Architectures.** Acceptance runs natively on amd64 and arm64. The consumer suite runs on amd64
+  only.
+- **Hiqlite snapshots across versions:** from source only (section 5).
+- **Bit-for-bit reproducibility:** not claimed; `BUILD_TIME` is stamped from the wall clock.
+- **A backup download cancelled by the client** is not separately asserted (unchanged from PR #2).
 
 ## 7. Publication status
 
-**Held.** The one remaining requirement is the published patched Hiqlite.
+**Held.** The one remaining condition is outside this repository:
 
-The final release must resolve published registry packages, and `hiqlite-patched`,
-`hiqlite-wal-patched` and `hiqlite-derive-patched` do not exist on crates.io. Everything else is
-ready: the tree, the fixes, the acceptance harness, and both workflows.
+> `hiqlite-patched`, `hiqlite-wal-patched` and `hiqlite-derive-patched` `0.15.0-patched.1` are not
+> on crates.io (checked against the crates.io API), and `bartekus/hiqlite` has no release tag for
+> them. Their tree is `release/downstream-packaging` @ `34641b0a`, with its PRs #25 to #30 open.
 
-When the packages are published, the change to this tree is confined to `Cargo.toml` and
-`Cargo.lock`:
+When they are published, the change here is one line in `Cargo.toml` (git source to
+`version = "=0.15.0-patched.1"`) and the lock, then:
 
-```toml
-hiqlite = { package = "hiqlite-patched", version = "<selected>", features = [
-    "cache", "cast_ints", "counters", "dashboard", "listen_notify_local", "macros"
-] }
-```
+1. `check_graph.py Cargo.lock` must pass as a release graph, and the published checksums and
+   source commit must be the ones the Hiqlite owner reports.
+2. The candidate workflow runs on the branch, a pull request into `patched/0.36.2` gets the
+   independent review, findings are addressed, and the pull request is merged.
+3. The candidate workflow runs again **on the merge commit**; that run, strict, first attempt, is
+   the only one the publish gate accepts.
+4. `release-publish.yaml` is dispatched from `patched/0.36.2` with that run's id.
+5. If the GHCR package is private after the first push, making it public is an owner action no
+   workflow token can perform:
+   https://github.com/users/bartekus/packages/container/rauthy-patched/settings -> Change package
+   visibility -> Public.
 
-with the matching `package` aliases for `hiqlite-wal` and `hiqlite-derive` where they appear as
-direct dependencies inside the patched `hiqlite` package itself.
-
-**The alias mechanism was verified, provisionally.** In an isolated scratch checkout, the repaired
-Hiqlite tree was renamed to the three `-patched` package names, its internal dependencies aliased
-back, and this candidate pointed at it through `hiqlite = { package = "hiqlite-patched", ... }`:
-
-- `cargo check --workspace --all-targets` compiles clean with **no source change**. Not one `use
-  hiqlite::...` has to move, and the derive macros keep resolving, because the alias restores the
-  name `hiqlite` inside the consuming crate, which is what the generated `::hiqlite` paths need.
-- `cargo tree` and `cargo metadata` resolve exactly three packages matching `hiqlite*`:
-  `hiqlite-patched`, `hiqlite-wal-patched` and `hiqlite-derive-patched`. No upstream `hiqlite`
-  copy survives anywhere in the graph.
-
-That result is **provisional**: it used a local path to a rename of the repaired tree, not the
-published packages, and the published versions and their contents may differ. It de-risks the
-mechanism; it does not qualify a release.
-
-After the real swap:
-
-1. `cargo tree -i hiqlite-patched` and `cargo metadata` must again show the patched packages
-   selected for every storage path, with no second upstream copy in the graph. The publish
-   workflow enforces this on its own: it refuses to run if any package matching `hiqlite*`
-   resolves to anything but a registry, or if `Cargo.toml` still carries an active
-   `[patch.crates-io]` entry for one. That guard was exercised against the path-based experiment
-   above, which it correctly refuses.
-2. Re-run the full candidate workflow. The dependency changed, so every earlier result is void.
-3. Re-check the two hiqlite contracts the consumer's backup verb reads rather than calls: the
-   snapshot file name (`backup_node_<id>_<seconds>.sqlite`, whose timestamp the consumer parses)
-   and the window during which a fresh backup request is suppressed. Neither is a rauthy API, so
-   nothing in rauthy's own suite would notice them changing.
-4. Publish from the run that tested the new graph.
-
-Note for whoever does the swap: `.cargo/config.toml` sets `global-min-publish-age = '10 days'`
-under `[unstable]`. It is only honoured by nightly cargo, and this release builds on stable
-`1.95.0`, so a freshly published package is not blocked. A `just update` run on nightly inside that
-window would be.
+`.cargo/config.toml` sets `global-min-publish-age = '10 days'` under `[unstable]`; only nightly
+cargo honours it, and this release builds on stable `1.95.0`, so a freshly published package is
+not blocked.
 
 ## 8. Publication design
 
-Two workflows, and neither shares a credential with the other's job.
+Three workflows, and no job holds a credential another job's step needs.
 
-- `release-candidate.yaml` builds the frontend and wasm once, runs style and unit checks, runs the
-  integration suite on both backends, builds the release binary per architecture inside a
-  `rust:1.95.0-bookworm` container, and runs the acceptance harness against those binaries on
-  native runners for both architectures. Every job declares `contents: read` and nothing else, and
-  no job references a registry token.
-- `release-review.yaml` is the independent review, and it is a separate file for an empirical
-  reason: `claude-code-action` refuses a `push` event outright ("Unsupported event type: push"),
-  which the first candidate run established rather than assumed. It therefore hangs off the pull
-  request that opens the release line. It is `pull_request`, never `pull_request_target`, so a
-  fork's code gets no secrets and a read-only token. The job holds `contents: read` and
-  `pull-requests: write`, and no publication credential.
-- `release-publish.yaml` builds no code. It takes the binaries a named candidate run produced,
-  verifies them against their recorded checksums, packages them, pushes the multi-architecture
-  image, attests it, pulls it back by digest, compares the shipped binary against the tested bytes,
-  and only then creates the release. It refuses to run if the tag already exists in the registry
-  and refuses if the version asked for does not match `Cargo.toml`.
+- `release-candidate.yaml` (push to `release/**` or `patched/**`, or dispatch) holds
+  `contents: read` only. It builds the frontend and wasm once, records and checks the dependency
+  graph, runs style and unit checks, runs the integration suite on both backends, builds the
+  release binary per architecture inside `rust:1.95.0-bookworm` (glibc floor at most `GLIBC_2.34`,
+  measured; `debian:bookworm-slim` provides 2.36), writes a manifest per architecture (commit,
+  `Cargo.lock` sha256, registry-graph verdict, `rustc -vV`, binary sha256, glibc floor), runs
+  acceptance strict on native amd64 and arm64 against the real upstream baseline binary, and runs
+  the consumer's live suite against an image built from the candidate bytes.
+- `release-review.yaml` (`pull_request` into `patched/**`, never `pull_request_target`) holds
+  `contents: read` and `pull-requests: write` and the review credential, nothing else, and
+  publishes the reviewer's verdict itself.
+- `release-publish.yaml` (dispatch, from `patched/*` only) builds nothing:
+  - **gate** (read-only) refuses unless the commit is the merge of a pull request into
+    `patched/*` whose reviewed head has the same tree and a successful review run; the candidate
+    run is `release-candidate.yaml` in this repository, on this exact commit, first attempt, every
+    expected job green; both architectures' acceptance ran strict with nothing failed or skipped;
+    both manifests name this commit and this `Cargo.lock` and a registry-only graph; the graph
+    passes `check_graph.py`; and the tag does not exist.
+  - **image** is the only job with `packages: write`. It pushes the multi-architecture image from
+    the tested binaries and attests it.
+  - **verify** pulls by digest on native amd64 and arm64, compares the binary byte for byte with
+    the tested one, checks the labels and the licence, starts the image until `/ready` answers
+    `200`, and checks a clean shutdown.
+  - **release** is the only job with `contents: write`. It creates the tag and the release only
+    after both verifications, with the binaries, `SHA256SUMS`, `LICENSE`, the image index, a
+    generated `RELEASE-PROVENANCE.md`, this ledger and the handoff.
 
-The bookworm build container is not cosmetic: it puts a glibc floor under the artifact that the
-consumer's runtime can meet. Measured on the candidate binaries: both require at most
-`GLIBC_2.34`, and `debian:bookworm-slim` provides 2.36. Building on the runner's own glibc (2.39
-on `ubuntu-24.04`) would raise that floor above what `distroless/cc-debian12` and the consumer's
-`debian:bookworm-slim` runtime provide, and the binary would not run where it has to.
-
-The consumer's consumption pattern was exercised directly against the candidate binaries, in an
-isolated workspace and without touching the consumer's checkout: the image was built from them,
-`/app/rauthy` copied out of it into `debian:bookworm-slim` exactly as `rahi`'s Dockerfile does,
-and the result runs and reports `rauthy 0.36.2-patched.1`. The image labels were read back off the
-built image and carry upstream's authorship and licence alongside the downstream source, vendor
-and upstream-base labels.
-
-`CARGO_REGISTRY_TOKEN` is present as a repository secret and is referenced by no workflow. This
-release publishes binaries and an OCI image; it publishes no Rust package, so it needs no crates.io
-credential. A cargo token would not grant GHCR permission in any case.
+`CARGO_REGISTRY_TOKEN` is a repository secret referenced by no workflow: this release publishes
+binaries and an OCI image, not a Rust package. `CLAUDE_CODE_OAUTH_TOKEN` is referenced only by the
+review workflow.
 
 ## 9. Independent review
 
-`release-review.yaml` reviewed the candidate against `v0.36.2`. Its verdict was that nothing found
-should block the release, with one concrete defect: the residual `panic = "abort"` exit paths in
-`server_with_metrics()` described as F7 above, which it correctly identified as contradicting F2's
-own claim rather than as a separate issue. The review also verified, by inspection rather than by
-taking this ledger's word for it, that `[patch.crates-io]` is commented out, that all three
-Hiqlite packages resolve to crates.io with the checksums section 4 lists, that no workflow
-references `CARGO_REGISTRY_TOKEN`, and that the review workflow's `pull_request` trigger is the
-safe one.
+PR #2's seven rounds reviewed the tree against `hiqlite 0.14.0`; rounds 2, 4 and 6 found real
+defects (F7, F8, and two acceptance assertions that could not fail), all fixed. That evidence
+stands for the code it reviewed and unchanged since.
 
-F7 was fixed rather than added to the disclosed limitations, and acceptance leg L was added to
-hold it: the release now proves that exit path the same way it proves the listener one, instead of
-asserting it.
-
-The second round reviewed the tree with F7 in it and returned a blocking verdict on F8, the TLS
-load and renewal paths. It was right, including about the reason it had gone unnoticed: the
-acceptance config served plain HTTP throughout, so section 6's table claimed a defect class it did
-not actually cover for TLS. F8 is fixed and acceptance leg M closes that hole. The same round also
-noted that the new S3 error branch put a raw object-store error into the response body, bypassing
-the conversion this ledger vetted for credential safety; the cause now goes to the log and the
-client gets a message without it.
-
-Round six returned a clean verdict on the product code and four findings in the verification
-harness itself, two of which were the serious kind: assertions the ledger cited as evidence that
-could not fail.
-
-- `grep -qv PATTERN file` is not "PATTERN is absent from file". It succeeds as soon as any one
-  line lacks the pattern, which is true of every multi-line log. The credential-safety assertion
-  was therefore vacuous. Confirmed on GNU grep, which is what CI runs: it returns 0 whether or
-  not the secret is present. It is `! grep -q` now, against a distinctive sentinel rather than
-  the word `nothing`, which would have been indistinguishable from ordinary log prose anyway.
-- The restore-refusal leg aimed a doomed restore at an empty directory and then checked that a
-  *different* node's backup file was unchanged, which was true no matter what happened. The state
-  that has to survive is the restoring node's own, so that node is populated first, the bad
-  restore is aimed at the directory it owns, and the assertions are that it still starts on its
-  own data, did not re-bootstrap, and kept its signing keys.
-- The exit trap tracked only node PIDs, so a cancelled run leaked the port squatters and the
-  Postgres container onto a reused runner. It tracks both now, and fires on `INT` and `TERM` as
-  well as `EXIT`.
-- The review workflow told its own reviewer to `git diff v0.36.2...HEAD`, and this fork carries
-  no tags at all: that tag is upstream's, and this release line deliberately does not republish
-  upstream release tags under its own name. The prompt names the commit now.
-
-Two of those four are the same failure this ledger keeps being caught by, one level down: a claim
-resting on something that does not actually check it. A test that cannot fail is worse than no
-test, because it is cited as evidence.
-
-Round five returned a clean verdict and one narrow observation it explicitly did not call a
-defect: `get_backup_local` read the file's length once and committed to it as `Content-Length`, so
-a file that grew mid-download would have framed the response wrongly. Nothing appends to a
-finished backup and the route lists only completed files, so it was not reachable. It was closed
-anyway, because it is two lines and the function's whole purpose is to make the response's framing
-trustworthy: `pump_reader` now treats the declared length as a bound in both directions, sending
-no more than it and failing the stream rather than ending short of it.
-
-The pattern across the rounds is worth naming: each time, the review found a place where this
-ledger claimed more completeness than the code had. That is the failure mode a release document
-invites, and it is why the review reads the ledger as well as the diff.
-
-Two earlier review attempts are part of the record because both failed in ways worth keeping:
-
-- The first refused to run at all (`Unsupported event type: push`), which is why the review lives
-  in its own `pull_request`-triggered workflow.
-- The second ran to completion and left nothing behind: no comment, no job summary, and an
-  execution log that stays on the runner. A review that evaporates is indistinguishable from an
-  approval, so the workflow now extracts the verdict from the execution log itself and publishes
-  it, rather than asking the reviewer to remember to.
+**Everything in section 3 marked new, the dependency swap, the acceptance legs and the publication
+workflow have not yet had an independent review.** The review runs on the pull request that
+carries the final graph; its run and its disposition are recorded here when it exists.
 
 ## 10. Upstream return path and maintenance
 
-F1 through F4 and F7 through F9 are defects in upstream `v0.36.2` and are candidates for upstream pull requests
-against upstream's development line, where the same code paths are unchanged. That is a separate
-piece of work in the upstream repository and nothing in this release touches it.
+F1 to F4 and F7 to F13 are candidates for upstream pull requests against upstream's development
+line; nothing in this release touches the upstream repository. The Hiqlite findings in 3.4 belong
+to the Hiqlite fork's own record.
 
-`CHANGELOG.md` is deliberately untouched. It is upstream's record of upstream's releases, and
-editing it here would put downstream entries in the way of every future rebase onto a new upstream
-patch release. This ledger is this distribution's changelog.
+`CHANGELOG.md` is deliberately untouched; this ledger is this distribution's changelog.
 
-Downstream security maintenance: this line tracks upstream `v0.36.x`. An upstream patch release
-becomes `0.36.<z>-patched.1` on a new `release/` branch cut from that tag, with this ledger and the
-acceptance matrix re-run in full. Patch levels within one base increment: `-patched.2` and onward.
-Published tags never move.
+This line tracks upstream `v0.36.x`. An upstream patch release becomes `0.36.<z>-patched.1` on a new
+`release/` branch cut from that tag, with this ledger and the acceptance matrix re-run in full.
+Patch levels within one base increment. Published tags never move.

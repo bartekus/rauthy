@@ -182,8 +182,13 @@ read now fails the start unless it is the default `./config.toml` and simply abs
 4. Remove the variable. Every later start runs without it.
 
 Started without the variable, the node refuses with an error that names both directories, the
-variable and the manual alternative, ends "Nothing was changed.", and exits `1`. That is the
-designed failure, not a crash. With `HQL_CACHE_STORAGE_DISK=false` there is nothing to move.
+variable and the manual alternative, and exits `1`. That is the designed failure, not a crash.
+Measured on a directory upstream left behind: the database's raft log is byte-identical afterwards
+and the database content is identical, but the file's bytes are not, because the refusal comes
+after the SQLite group has opened the database, which checkpoints its WAL and adds one
+`sqlite_stat1` statistics row. The message's closing "Nothing was changed." is therefore stronger
+than what holds; reported to the Hiqlite owner. With `HQL_CACHE_STORAGE_DISK=false` there is
+nothing to move.
 
 What an empty cache costs: in-flight authorization codes, device codes, WebAuthn challenges, PoW
 challenges, rate-limit counters and IP-blacklist entries. **Sessions are not lost**: Rauthy
@@ -225,7 +230,7 @@ own data directory and ports.
 | Restore into an owned directory | R | Hiqlite | refused before any restore step; owner's data intact in memory and on disk |
 | Live storage failure, Postgres | K | Postgres | the database container is stopped under a live node: `/ready` `503`, `/health` `500` |
 | Live storage failure, embedded Hiqlite | P | Hiqlite | the Raft log directory is made read-only and writes are driven until the WAL writer cannot rotate: `/ready` `503` within seconds, `/health` `500`, writes and reads refused with no storage path in the body, no abort, SIGTERM exit without a kill, recovery with every acknowledged write |
-| Upgrade and rollback against the real baseline | J | Hiqlite | the upstream `v0.36.2` binary from its own image writes data; the raw upgrade is refused and changes nothing; the opt-in upgrade keeps keys, identity and upstream-written data and moves the cache aside; a later start needs no opt-in; the rollback reads patched-written data |
+| Upgrade and rollback against the real baseline | J | Hiqlite | the upstream `v0.36.2` binary from its own image writes data; the raw upgrade is refused with its raft log byte-identical and its database content unchanged; the opt-in upgrade keeps keys, identity and upstream-written data and moves the cache aside; a later start needs no opt-in; the rollback reads patched-written data |
 | TLS and metrics exit paths | M, L | Hiqlite | F8, F7 |
 | Login, session, logout | `handler_auth`, `handler_users`, `handler_sessions` | both | |
 | Native clients, device grant, refresh, revocation, bearer writes | `handler_auth::{test_device_code_flow, test_token_revocation, test_password_flow, test_dpop, test_client_credentials_flow}`, `handler_api_keys` | both | F6 |
@@ -249,7 +254,8 @@ and cannot qualify publication.
 | Hiqlite `c7d0d6a9` | CI run `35764291279`, amd64 and arm64 | 99 passed, 3 failed (J: the upgrade abort, 3.4), 0 skipped; integration suites green on both backends |
 | Hiqlite `d45826cd` | CI run `35767263504`, amd64 and arm64 | 101 passed, 3 failed (J, same cause); integration suites failed on F14 on both backends |
 | Hiqlite `d45826cd` + F12 | local, macOS arm64 | 98 passed, 0 failed, 2 skipped (J needs the Linux upstream binary) |
-| Hiqlite `34641b0a` | CI run `35770325131` | recorded in section 7 when it completes |
+| Hiqlite `34641b0a` | CI run `35771464936`, amd64 and arm64 | 113 passed, 1 failed (the refused upgrade's byte-level database check, which found the checkpoint described in section 5), 0 skipped; integration suites green on both backends |
+| Hiqlite `c7d0d6a9` | CI run `35764291279`, consumer job | Rahi's whole live suite: 606 passed, 0 failed, 1 ignored by Rahi itself, no skips; the passkey-only backup administrator proof ran and passed |
 
 The qualifying run is the one section 7 names, on the merge commit, against the published graph.
 

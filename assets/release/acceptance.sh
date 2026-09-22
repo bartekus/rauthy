@@ -526,9 +526,26 @@ else
     && grep -q "Nothing was changed" "$J/rauthy.log"
   assert "the refusal names the cache log, the opt-in, and that nothing changed" $? \
     "$(tail -3 "$J/rauthy.log")"
-  diff -r "$J/data/state_machine" "$J/data-as-upstream-left-it/state_machine" > /dev/null \
-    && diff -r "$J/data/logs" "$J/data-as-upstream-left-it/logs" > /dev/null
-  assert "the refused upgrade changed nothing in the database or its log" $?
+  # The Raft log must be byte for byte what upstream left. The database is compared by content:
+  # the refusal comes after the SQLite group has opened the file, which checkpoints its WAL and
+  # records optimizer statistics in `sqlite_stat1`, so its bytes change while its data does not.
+  diff -r "$J/data/logs" "$J/data-as-upstream-left-it/logs" > /dev/null
+  assert "the refused upgrade left the database's raft log byte-identical" $?
+  python3 - "$J/data-as-upstream-left-it/state_machine/db/hiqlite.db" \
+    "$J/data/state_machine/db/hiqlite.db" <<'PYEOF'
+import shutil, sqlite3, sys, tempfile
+def dump(path):
+    # Work on a copy, so that reading it cannot change the evidence either.
+    d = tempfile.mkdtemp()
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            shutil.copy(path + suffix, f"{d}/db{suffix}")
+        except FileNotFoundError:
+            pass
+    return [l for l in sqlite3.connect(f"{d}/db").iterdump() if "sqlite_stat1" not in l]
+sys.exit(0 if dump(sys.argv[1]) == dump(sys.argv[2]) else 1)
+PYEOF
+  assert "the refused upgrade left the database's content unchanged" $?
 
   # The procedure, through Hiqlite's supported opt-in for the one upgrade start: it moves the
   # cache raft's log and snapshots into pre-upgrade-<unix seconds>/ and deletes nothing.

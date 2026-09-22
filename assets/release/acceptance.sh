@@ -507,10 +507,31 @@ else
   wait_ready "$J" 8099 300
   assert "the upstream baseline boots and populates a data directory" $? "see $J/rauthy.log"
   KID_UP="$(jwks_kid 8099)"
+  [ "$(create_group 8099 acceptance_written_by_upstream)" = "200" ]
+  assert "the upstream baseline accepts a write" $?
   stop_node "$J"
   sleep 3
+  cp -a "$J/data" "$J/data-as-upstream-left-it"
 
+  # The cache raft's log format changed after hiqlite 0.14.0 and is not readable across the
+  # upgrade; the SQLite database and its raft log are. Started on the directory as upstream left
+  # it, the patched build must refuse with an error that names the procedure, not abort, and must
+  # leave the directory as it found it.
   mv "$J/rauthy.log" "$J/upstream-run.log"
+  run_until_exit "$J" 8099 8109 8209 180
+  RC=$?
+  [ "$RC" -ne 0 ] && [ "$RC" -ne 134 ] && [ "$RC" -ne 124 ]
+  assert "an upgrade without the cache procedure is refused, not aborted" $? "exit code was $RC"
+  grep -q "logs_cache" "$J/rauthy.log"
+  assert "the refusal names the cache log directory" $? "$(tail -3 "$J/rauthy.log")"
+  diff -r "$J/data/state_machine" "$J/data-as-upstream-left-it/state_machine" > /dev/null \
+    && diff -r "$J/data/logs" "$J/data-as-upstream-left-it/logs" > /dev/null
+  assert "the refused upgrade changed nothing in the database or its log" $?
+
+  # The procedure: move the cache raft's log and snapshots aside. Nothing is deleted.
+  mv "$J/rauthy.log" "$J/refused-upgrade.log"
+  mkdir -p "$J/data/pre-upgrade"
+  mv "$J/data/logs_cache" "$J/data/state_machine_cache" "$J/data/pre-upgrade/"
   start_node "$J" 8099 8109 8209
   wait_ready "$J" 8099 300
   assert "the patched build starts on the upstream data directory" $? "see $J/rauthy.log"
@@ -521,15 +542,27 @@ else
   [ -n "$(admin_identity 8099)" ]
   assert "the upgraded instance keeps the original identity" $? \
     "no $ADMIN_EMAIL after the upgrade"
+  group_exists 8099 acceptance_written_by_upstream
+  assert "data written by the upstream baseline survives the upgrade" $?
+  [ "$(create_group 8099 acceptance_written_by_patched)" = "200" ]
+  assert "the upgraded instance accepts writes" $?
   stop_node "$J"
   sleep 3
 
-  # Rollback: the version this build stamps into the config table must not lock upstream out.
+  # Rollback: the same procedure in the other direction, because upstream has no way to refuse a
+  # cache log it cannot read. The version this build stamps into the config table must not lock
+  # upstream out, and what the patched build wrote must be readable by upstream.
   mv "$J/rauthy.log" "$J/patched-run.log"
+  mkdir -p "$J/data/pre-rollback"
+  mv "$J/data/logs_cache" "$J/data/state_machine_cache" "$J/data/pre-rollback/"
   BIN="$UPSTREAM" start_node "$J" 8099 8109 8209
   wait_ready "$J" 8099 300
   assert "the upstream baseline still starts after the upgrade" $? \
     "rollback is blocked: $(tail -5 "$J/rauthy.log")"
+  [ "$(jwks_kid 8099)" = "$KID_UP" ]
+  assert "the rollback keeps the signing key" $?
+  group_exists 8099 acceptance_written_by_patched
+  assert "data written by the patched build survives the rollback" $?
   stop_node "$J"
 fi
 

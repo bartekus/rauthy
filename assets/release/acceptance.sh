@@ -12,8 +12,11 @@
 # The second binary, when given, is the upstream release this build is based on; it enables the
 # upgrade and rollback legs. Without it those legs are reported as skipped.
 #
-# Exits non-zero on the first failed assertion. Every scenario is independent: each gets its own
-# data directory and its own ports.
+# Exits non-zero if any assertion failed. Every scenario is independent: each gets its own data
+# directory and its own ports.
+#
+# ACCEPTANCE_STRICT=1 also fails the run on any skipped leg. A publication candidate runs strict,
+# because a leg that could not run is a leg that was not qualified, however it is reported.
 
 set -uo pipefail
 
@@ -32,7 +35,7 @@ ADMIN_PASSWORD="Acceptance123SuperSafe!"
 # `ApiKeyRequest`; the secret has to be exactly `API_KEY_LENGTH` characters.
 API_KEY_NAME="acceptance"
 API_KEY_SECRET="AcceptanceApiKeySecret0123456789AcceptanceApiKeySecret0123456789"
-API_KEY_JSON='{"name":"acceptance","exp":null,"access":[{"group":"Users","access_rights":["read"]}]}'
+API_KEY_JSON='{"name":"acceptance","exp":null,"access":[{"group":"Users","access_rights":["read"]},{"group":"Groups","access_rights":["read","create"]}]}'
 API_KEY_B64="$(printf '%s' "$API_KEY_JSON" | base64 | tr -d '\n')"
 
 PASS=0
@@ -159,6 +162,20 @@ admin_identity() {
     | grep -o "\"email\":\"$ADMIN_EMAIL\"" | head -1
 }
 
+API_KEY_HEADER="Authorization: API-Key ${API_KEY_NAME}\$${API_KEY_SECRET}"
+
+# create_group <http-port> <name> - prints the HTTP status of one real database write.
+create_group() {
+  curl -s -o /dev/null -w '%{http_code}' -X POST -H "$API_KEY_HEADER" \
+    -H 'Content-Type: application/json' -d "{\"group\":\"$2\"}" \
+    "http://127.0.0.1:$1/auth/v1/groups"
+}
+
+# group_exists <http-port> <name>
+group_exists() {
+  curl -s -H "$API_KEY_HEADER" "http://127.0.0.1:$1/auth/v1/groups" | grep -q "\"name\":\"$2\""
+}
+
 sha256_of() {
   if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1
   else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -226,6 +243,18 @@ assert "the instance publishes a signing key" $? "empty JWKS"
 assert "the bootstrapped identity authenticates and is readable" $? \
   "no $ADMIN_EMAIL behind the API key"
 
+# The production frontend is embedded into the binary at build time. A binary built without it
+# still starts and still passes every API leg, so it is checked here on its own: the index page
+# the server renders must reference a built bundle, and that bundle must be served.
+INDEX="$(curl -s "http://127.0.0.1:8091/auth/v1/")"
+ENTRY="$(printf '%s' "$INDEX" | grep -o '_app/immutable/entry/start\.[A-Za-z0-9_-]*\.js' | head -1)"
+[ -n "$ENTRY" ]
+assert "the served index references the built frontend bundle" $? "no bundle in /auth/v1/"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8091/auth/v1/$ENTRY")" = "200" ]
+assert "the frontend bundle is served" $? "GET /auth/v1/$ENTRY did not answer 200"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8091/auth/v1/account")" = "200" ]
+assert "the account page is served" $?
+
 # --- C: bad configuration ----------------------------------------------------
 
 log "C. Missing, malformed and conflicting configuration"
@@ -272,6 +301,15 @@ assert "a backend that cannot be reached fails the start" $? "exit code was $RC"
 ! grep -q "$PG_SENTINEL" "$CONF/rauthy.log"
 assert "the startup failure does not echo the database password" $? \
   "$(grep -n "$PG_SENTINEL" "$CONF/rauthy.log" | head -2)"
+# The embedded node had already started when the Postgres connection failed, inside
+# `DB::init()` and before `run()` held a client it could shut down. A second start on the same
+# directory reads whether the first one shut its storage down.
+mv "$CONF/rauthy.log" "$CONF/first-attempt.log"
+run_until_exit "$CONF" 8092 8102 8202 180 HIQLITE=false PG_HOST=127.0.0.1 PG_PORT=1 \
+  PG_USER=nobody "PG_PASSWORD=$PG_SENTINEL"
+[ "$(unclean_markers "$CONF")" = "0" ]
+assert "a backend failure inside DB::init shut the embedded storage down" $? \
+  "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$CONF/rauthy.log" | head -3)"
 
 # --- D: listener bind failure ------------------------------------------------
 
@@ -330,8 +368,10 @@ E2="$WORK/e-contend-second"; mkdir -p "$E2"; cp "$CONFIG_TEMPLATE" "$E2/config.t
 RC="$(cat "$E2/rc" 2>/dev/null || echo 124)"
 [ "$RC" != "0" ]
 assert "the second process refuses to open the data directory" $? "exit code was $RC"
-grep -qiE 'lock|in use by another process' "$E2/rauthy.log"
-assert "the refusal names the storage lock" $? "$(tail -3 "$E2/rauthy.log")"
+# Hiqlite's typed refusal: it names the owner and says nothing in the directory was changed.
+grep -qE 'StorageInUse: .*owned by another live process.*has changed nothing' "$E2/rauthy.log"
+assert "the refusal is the storage-ownership error and changed nothing" $? \
+  "$(tail -3 "$E2/rauthy.log")"
 
 curl -s "http://127.0.0.1:8094/auth/v1/health" | grep -q '"db_healthy":true'
 assert "the first node is unharmed by the second one's attempt" $?
@@ -384,6 +424,12 @@ fi
 if [ -n "$BACKUP_FILE" ]; then
   head -c 16 "$BACKUP_FILE" | grep -q "SQLite format 3"
   assert "the backup is a SQLite database" $?
+  # A consumer parses the node id and the unix timestamp out of this name to find the snapshot
+  # its own trigger produced. It is Hiqlite's format, not Rauthy's, so a Hiqlite package swap is
+  # exactly what could change it without anything in Rauthy's own suite noticing.
+  basename "$BACKUP_FILE" | grep -qE '^backup_node_1_[0-9]{10}\.sqlite$'
+  assert "the backup keeps the backup_node_<id>_<seconds>.sqlite name" $? \
+    "got $(basename "$BACKUP_FILE")"
 
   stop_node "$E"
   sleep 3
@@ -627,9 +673,186 @@ else
   "$DOCKER" rm -f "$PGC" >/dev/null 2>&1
 fi
 
+# --- Q: an interrupted run ----------------------------------------------------
+
+log "Q. A node killed under write load, then restart and recovery"
+# The graceful path is leg F. This is the other one: the process is killed outright, which is what
+# an orchestrator does when a grace period runs out. Killing it *during* its storage shutdown
+# cannot be scheduled from outside: at N = 1 that shutdown takes tens of milliseconds. Killing it
+# while writes are in flight is deterministic and leaves the same thing behind, a data directory
+# that was not shut down. The storage layer must recover on its own at the next start and keep
+# everything that was acknowledged before.
+Q="$WORK/q-interrupted"
+start_node "$Q" 8081 8111 8211
+wait_ready "$Q" 8081 300
+assert "the node to be killed is serving" $? "see $Q/rauthy.log"
+[ "$(create_group 8081 acceptance_before_kill)" = "200" ]
+assert "a write is acknowledged before the kill" $?
+KID_Q="$(jwks_kid 8081)"
+( for i in $(seq 1 400); do create_group 8081 "acceptance_inflight_$i" > /dev/null; done ) &
+LOAD=$!
+HELPER_PIDS="$HELPER_PIDS $LOAD"
+sleep 1
+kill -KILL "$(cat "$Q/pid")" 2>/dev/null
+kill "$LOAD" 2>/dev/null; wait "$LOAD" 2>/dev/null
+for _ in $(seq 1 30); do [ -f "$Q/rc" ] && break; sleep 1; done
+rm -f "$Q/pid"
+[ "$(cat "$Q/rc" 2>/dev/null)" = "137" ]
+assert "the node was killed, not shut down" $? "exit code was $(cat "$Q/rc" 2>/dev/null)"
+mv "$Q/rauthy.log" "$Q/killed-run.log"
+start_node "$Q" 8081 8111 8211
+wait_ready "$Q" 8081 300
+assert "the node recovers after being killed" $? "see $Q/rauthy.log"
+# Without this the leg could pass on a directory that happened to be clean, and would then not
+# have exercised recovery at all.
+[ "$(unclean_markers "$Q")" != "0" ]
+assert "the next start recognised the unclean shutdown" $?
+group_exists 8081 acceptance_before_kill
+assert "the write acknowledged before the kill survives it" $?
+[ "$(jwks_kid 8081)" = "$KID_Q" ]
+assert "the signing key survives the kill" $? "before: $KID_Q after: $(jwks_kid 8081)"
+[ -n "$(admin_identity 8081)" ]
+assert "the identity survives the kill" $?
+[ "$(create_group 8081 acceptance_after_kill)" = "200" ]
+assert "the recovered node accepts writes" $?
+stop_node "$Q"
+[ "$(cat "$Q/rc" 2>/dev/null)" = "0" ]
+assert "the recovered node shuts down cleanly" $? "exit code was $(cat "$Q/rc" 2>/dev/null)"
+
+# --- R: a restore aimed at a directory another process owns -------------------
+
+log "R. A restore aimed at a data directory another process owns"
+# A restore replaces the database, so it is the most destructive thing a start can do. Aimed at a
+# directory a running node owns, it must be refused before anything is touched, and the running
+# node must not notice.
+if [ -z "${BACKUP_FILE:-}" ]; then
+  skip "a restore into an owned directory is refused" "no backup file from leg G"
+else
+  R="$WORK/r-owned-restore"
+  start_node "$R" 8082 8112 8212
+  wait_ready "$R" 8082 300
+  assert "the owning node is serving" $? "see $R/rauthy.log"
+  [ "$(create_group 8082 acceptance_owned)" = "200" ]
+  assert "the owning node has data of its own" $?
+  KID_R="$(jwks_kid 8082)"
+  R2="$WORK/r-owned-restore-second"; mkdir -p "$R2"; cp "$CONFIG_TEMPLATE" "$R2/config.toml"
+  cp "$BACKUP_FILE" "$R2/backup.sqlite"
+  (
+    cd "$R2"
+    env HQL_DATA_DIR="$R/data" HQL_NODES="1 localhost:8113 localhost:8213" \
+      HQL_BACKUP_RESTORE="file:$R2/backup.sqlite" \
+      LISTEN_ADDRESS=127.0.0.1 LISTEN_PORT_HTTP=8083 PUB_URL=localhost:8083 \
+      RP_ORIGIN=http://localhost:8083 \
+      BOOTSTRAP_ADMIN_EMAIL="$ADMIN_EMAIL" BOOTSTRAP_ADMIN_PASSWORD_PLAIN="$ADMIN_PASSWORD" \
+      "$RAUTHY" serve -c config.toml > "$R2/rauthy.log" 2>&1
+    echo $? > "$R2/rc"
+  )
+  RC="$(cat "$R2/rc" 2>/dev/null || echo 124)"
+  [ "$RC" != "0" ]
+  assert "a restore into an owned directory is refused" $? "exit code was $RC"
+  grep -qE 'StorageInUse: .*owned by another live process.*has changed nothing' "$R2/rauthy.log"
+  assert "the refused restore is the storage-ownership error" $? "$(tail -3 "$R2/rauthy.log")"
+  ! grep -qE 'Found backup restore request|Starting database restore' "$R2/rauthy.log"
+  assert "the refused restore did not start restoring" $? \
+    "$(grep -iE 'restor' "$R2/rauthy.log" | head -3)"
+  curl -s "http://127.0.0.1:8082/auth/v1/health" | grep -q '"db_healthy":true'
+  assert "the owning node is unharmed by the refused restore" $?
+  group_exists 8082 acceptance_owned
+  assert "the owning node still has its own data" $?
+  [ "$(jwks_kid 8082)" = "$KID_R" ]
+  assert "the owning node kept its signing keys" $?
+  stop_node "$R"
+  mv "$R/rauthy.log" "$R/first-run.log"
+  start_node "$R" 8082 8112 8212
+  wait_ready "$R" 8082 300
+  assert "the owning node restarts on its own data" $? "see $R/rauthy.log"
+  group_exists 8082 acceptance_owned
+  assert "the refused restore replaced nothing on disk" $?
+  stop_node "$R"
+fi
+
+# --- P: a terminal failure of the embedded Hiqlite storage --------------------
+
+log "P. A terminal failure of the embedded Hiqlite storage"
+# Leg K takes Postgres away, which says nothing about the embedded backend. Here the Raft log
+# directory of a running node stops accepting new files, so the next WAL rotation fails inside
+# the log writer. That is a real I/O failure in the real writer, injected from outside the
+# process: Hiqlite takes the node out of service and refuses operations, and Rauthy has to make
+# that visible and must not keep answering as though it were healthy.
+if [ "$(id -u)" = "0" ]; then
+  skip "embedded storage failure is observable" "running as root, a read-only directory is not enforced"
+else
+  P="$WORK/p-hiqlite-failure"
+  # A small log file so that a few hundred writes reach a rotation.
+  start_node "$P" 8084 8114 8214 HQL_WAL_SIZE=262144
+  wait_ready "$P" 8084 300
+  assert "the node whose storage will fail is serving" $? "see $P/rauthy.log"
+  [ "$(create_group 8084 acceptance_before_failure)" = "200" ]
+  assert "a write succeeds before the failure" $?
+  KID_P="$(jwks_kid 8084)"
+  P_LOGS="$P/data/logs"
+  [ -d "$P_LOGS" ]
+  assert "the Raft log directory is where the injection expects it" $? "$(ls "$P/data")"
+  chmod a-w "$P_LOGS"
+
+  P_FAILED=1
+  for i in $(seq 1 3000); do
+    code="$(create_group 8084 "acceptance_fill_$i")"
+    if [ "$code" != "200" ]; then P_FAILED=0; break; fi
+  done
+  assert "the injected storage failure reaches the writer" $P_FAILED "3000 writes were all accepted"
+
+  READY_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8084/auth/v1/ready")"
+  for _ in $(seq 1 10); do
+    [ "$READY_CODE" = "503" ] && break
+    sleep 1
+    READY_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8084/auth/v1/ready")"
+  done
+  [ "$READY_CODE" = "503" ]
+  assert "readiness reports the embedded storage failure within seconds" $? \
+    "/ready answered $READY_CODE"
+  HEALTH_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8084/auth/v1/health")"
+  [ "$HEALTH_CODE" = "500" ]
+  assert "health reports the embedded storage failure" $? "/health answered $HEALTH_CODE"
+  [ "$(create_group 8084 acceptance_after_failure)" != "200" ]
+  assert "a write after the failure is refused" $?
+  kill -0 "$(cat "$P/pid")" 2>/dev/null
+  assert "the storage failure did not abort the process" $? "exit code $(cat "$P/rc" 2>/dev/null)"
+  grep -q "out of service" "$P/rauthy.log"
+  assert "the log names the node as out of service" $?
+  ! curl -s -X POST -H "$API_KEY_HEADER" -H 'Content-Type: application/json' \
+    -d '{"group":"acceptance_leak_probe"}' "http://127.0.0.1:8084/auth/v1/groups" | grep -q "$P_LOGS"
+  assert "the refusal does not expose the storage path to the client" $?
+
+  stop_node "$P"
+  P_RC="$(cat "$P/rc" 2>/dev/null || echo none)"
+  [ "$P_RC" != "none" ] && [ "$P_RC" != "137" ]
+  assert "the failed node exits on SIGTERM without being killed" $? "exit code was $P_RC"
+  chmod u+w "$P_LOGS"
+  mv "$P/rauthy.log" "$P/failed-run.log"
+  start_node "$P" 8084 8114 8214 HQL_WAL_SIZE=262144
+  wait_ready "$P" 8084 300
+  assert "the node recovers once its storage is writable again" $? "see $P/rauthy.log"
+  group_exists 8084 acceptance_before_failure
+  assert "a write acknowledged before the failure survives it" $?
+  [ "$(jwks_kid 8084)" = "$KID_P" ]
+  assert "the signing key survives the storage failure" $?
+  [ "$(create_group 8084 acceptance_after_recovery)" = "200" ]
+  assert "the recovered node accepts writes again" $?
+  stop_node "$P"
+fi
+
 # --- summary -----------------------------------------------------------------
 
 log "Summary"
 printf '%s\n' "${RESULTS[@]}"
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
-[ "$FAIL" -eq 0 ]
+# One machine-readable line, so that a publication step can check the result instead of the
+# exit code of a job that might have been configured to tolerate a failure.
+printf '{"passed":%d,"failed":%d,"skipped":%d,"strict":%s}\n' "$PASS" "$FAIL" "$SKIP" \
+  "$([ "${ACCEPTANCE_STRICT:-0}" = "1" ] && echo true || echo false)" > "$WORK/acceptance-result.json"
+[ "$FAIL" -eq 0 ] || exit 1
+if [ "${ACCEPTANCE_STRICT:-0}" = "1" ] && [ "$SKIP" -ne 0 ]; then
+  echo "strict run: $SKIP leg(s) skipped, which a publication candidate does not allow" >&2
+  exit 1
+fi

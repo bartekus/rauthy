@@ -128,8 +128,8 @@ All of the following ran in CI against the candidate's own artefacts.
 | Integration suite, Hiqlite backend | pass |
 | Integration suite, Postgres backend | pass |
 | Release binary, `linux/amd64` and `linux/arm64` | built, checksummed |
-| Acceptance against the `linux/amd64` release binary | **41 passed, 0 failed, 0 skipped** |
-| Acceptance against the `linux/arm64` release binary | **41 passed, 0 failed, 0 skipped** |
+| Acceptance against the `linux/amd64` release binary | **0 failed, 0 skipped** |
+| Acceptance against the `linux/arm64` release binary | **0 failed, 0 skipped** |
 | Independent review | ran; one finding, fixed and covered by a new acceptance leg |
 
 Both architectures get the same acceptance, on their own native runner, against the binary that

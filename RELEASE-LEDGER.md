@@ -144,10 +144,18 @@ N = 1 only, and single-node results say nothing about N = 3.
 `assets/release/acceptance.sh` runs the process-level legs against the release binary; the cargo
 suites run against a live backend on both database backends. Every repair maps to a test.
 
-Result on the candidate's own artefacts: **41 passed, 0 failed, 0 skipped** on `linux/amd64` and
-the same on `linux/arm64`, each on its own native runner, plus both integration suites and the
-style checks. The upgrade and rollback legs run against the real upstream `v0.36.2` binary taken
-out of `ghcr.io/sebadob/rauthy:0.36.2`, not a rebuild of it.
+Run it by hand with `assets/release/acceptance.sh <rauthy> [<upstream-rauthy>]`. The second binary
+enables the upgrade and rollback legs and is expected to be the upstream release this build is
+based on, taken out of its own published image; without it those two legs report as skipped rather
+than quietly passing. Each scenario gets its own data directory and its own ports, so a failure
+leaves its logs behind to read.
+
+Result on the candidate's own artefacts: the whole harness passes with **zero failures and zero
+skips** on `linux/amd64` and on `linux/arm64`, each on its own native runner, alongside both
+integration suites and the style checks. Every run prints its own assertion count, which grows as
+legs are added, so the count is read off the run rather than copied here. The upgrade and rollback
+legs run against the real upstream `v0.36.2` binary taken out of `ghcr.io/sebadob/rauthy:0.36.2`,
+not a rebuild of it.
 
 | Requirement | Test | Covers |
 |---|---|---|

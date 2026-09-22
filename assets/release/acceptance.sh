@@ -820,12 +820,16 @@ else
   assert "the storage failure did not abort the process" $? "exit code $(cat "$P/rc" 2>/dev/null)"
   grep -q "out of service" "$P/rauthy.log"
   assert "the log names the node as out of service" $?
-  # Recorded, not asserted. The patched Hiqlite refuses writes on a failed node through openraft's
-  # own fatal error, but its embedded client does not consult the failure record for local reads,
-  # so a read may still be answered from the last applied state. /ready is what takes the node out
-  # of rotation. The ledger states this rather than a leg claiming a refusal it cannot observe.
-  echo "  INFO read after the failure answered $(curl -s -o /dev/null -w '%{http_code}' \
-    -H "$API_KEY_HEADER" "http://127.0.0.1:8084/auth/v1/groups")"
+  # A failed node refuses its embedded client with `NodeFailed`, reads included, so a request
+  # that has to touch storage is refused rather than answered from the last applied state. The
+  # failure account names internal paths; the client gets a message without them.
+  READ_BODY="$(curl -s -H "$API_KEY_HEADER" -w '\n%{http_code}' "http://127.0.0.1:8084/auth/v1/groups")"
+  [ "$(printf '%s' "$READ_BODY" | tail -1)" != "200" ]
+  assert "a read after the failure is refused" $? "the read answered 200"
+  printf '%s' "$READ_BODY" | grep -q "storage layer of this node is out of service"
+  assert "the refusal says the storage is out of service" $? "$(printf '%s' "$READ_BODY" | head -c 300)"
+  ! printf '%s' "$READ_BODY" | grep -q "$P_LOGS"
+  assert "the refusal does not expose the storage path to the client" $?
 
   stop_node "$P"
   P_RC="$(cat "$P/rc" 2>/dev/null || echo none)"

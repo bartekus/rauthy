@@ -255,6 +255,7 @@ and cannot qualify publication.
 | Hiqlite `d45826cd` | CI run `35767263504`, amd64 and arm64 | 101 passed, 3 failed (J, same cause); integration suites failed on F14 on both backends |
 | Hiqlite `d45826cd` + F12 | local, macOS arm64 | 98 passed, 0 failed, 2 skipped (J needs the Linux upstream binary) |
 | Hiqlite `34641b0a` | CI run `35771464936`, amd64 and arm64 | 113 passed, 1 failed (the refused upgrade's byte-level database check, which found the checkpoint described in section 5), 0 skipped; integration suites green on both backends |
+| Hiqlite `e1e91355` (tip `ae2408c8`) | CI run `35783026757`, every job | the same figures after the leg E fix, now counting a leg E assertion that can fail: acceptance 117/0/0 strict on amd64 and arm64; both integration suites; Rahi 606 passed, 0 failed, 1 ignored by Rahi |
 | Hiqlite `e1e91355` (tip `f5323a2c`) | CI run `35775723599`, every job | acceptance **117 passed, 0 failed, 0 skipped, strict** on amd64 and on arm64; integration suites green on both backends; Rahi's whole live suite 606 passed, 0 failed, 1 ignored by Rahi itself, no skips, passkey-only backup administrator proof passing. The last scratch run: the graph is git-sourced, so it cannot qualify publication |
 | Hiqlite `c7d0d6a9` | CI run `35764291279`, consumer job | Rahi's whole live suite: 606 passed, 0 failed, 1 ignored by Rahi itself, no skips; the passkey-only backup administrator proof ran and passed |
 
@@ -352,6 +353,13 @@ notifications. That exposed a gap in the gate, which accepted any successful rev
 review workflow now requires the final line to be `VERDICT: no blocking findings` or
 `VERDICT: blocking findings` and fails the run on a missing or blocking verdict, so a successful
 run means a non-blocking verdict. Round 9 counts as no review.
+
+**Round 10** (review run `35783029980`, head `ae2408c8`, git-sourced graph) read the full diff
+against `v0.36.2` and the diff since round 8, cloned the patched Hiqlite at the pinned commit to
+check every API Rauthy relies on, confirmed the leg E fix and the verdict gate, and traced
+`check_graph.py` to confirm the gate refuses this git-sourced graph. `VERDICT: no blocking
+findings`. The same head's candidate run `35783026757` is green in every job: acceptance
+117/0/0 strict on amd64 and arm64, both integration suites, Rahi 606 passed, 0 failed.
 
 The final head, carrying the registry graph, gets its own review round before merge; the publish
 gate requires a successful review run on that exact head.

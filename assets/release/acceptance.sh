@@ -169,7 +169,23 @@ jwks_kid() {
     | tr ',' '\n' | grep -o '"kid":"[^"]*"' | sort | tr '\n' ' '
 }
 
-trap 'for d in "$WORK"/*/; do [ -f "$d/pid" ] && kill -KILL "$(cat "$d/pid")" 2>/dev/null; done' EXIT
+# Helpers that outlive a scenario if the run is killed: the port squatters and the Postgres
+# container. Tracked here so a cancelled run does not leak either onto a reused runner and fail
+# the next one for an unrelated reason.
+HELPER_PIDS=""
+HELPER_CONTAINERS=""
+
+cleanup() {
+  for d in "$WORK"/*/; do
+    [ -f "$d/pid" ] && kill -KILL "$(cat "$d/pid")" 2>/dev/null
+  done
+  for pid in $HELPER_PIDS; do kill -KILL "$pid" 2>/dev/null; done
+  for c in $HELPER_CONTAINERS; do
+    "${DOCKER:-docker}" rm -f "$c" > /dev/null 2>&1
+  done
+  return 0
+}
+trap cleanup EXIT INT TERM
 
 echo "acceptance work dir: $WORK"
 echo "binary under test:   $RAUTHY"
@@ -243,13 +259,19 @@ assert "the invalid cron was caught before the storage layer started" $? \
 
 # Conflicting: Postgres selected as the backend, with no Postgres to connect to.
 CONF="$C/conflicting"; mkdir -p "$CONF"; cp "$CONFIG_TEMPLATE" "$CONF/config.toml"
+# A sentinel rather than a word: the point is to find it if it is printed, and 'nothing' would
+# be indistinguishable from ordinary log prose.
+PG_SENTINEL='Pa55word-SENTINEL-must-never-be-logged'
 run_until_exit "$CONF" 8092 8102 8202 180 HIQLITE=false PG_HOST=127.0.0.1 PG_PORT=1 \
-  PG_USER=nobody PG_PASSWORD=nothing
+  PG_USER=nobody "PG_PASSWORD=$PG_SENTINEL"
 RC=$?
 [ "$RC" -ne 0 ]
 assert "a backend that cannot be reached fails the start" $? "exit code was $RC"
-grep -qv 'nothing' "$CONF/rauthy.log"
-assert "the startup failure does not echo the database password" $?
+# `grep -qv PATTERN` is not this assertion: it succeeds as soon as any one line lacks the
+# pattern, which is true of every multi-line log whether the secret is in it or not.
+! grep -q "$PG_SENTINEL" "$CONF/rauthy.log"
+assert "the startup failure does not echo the database password" $? \
+  "$(grep -n "$PG_SENTINEL" "$CONF/rauthy.log" | head -2)"
 
 # --- D: listener bind failure ------------------------------------------------
 
@@ -264,6 +286,7 @@ sys.stderr.write('bound\n'); sys.stderr.flush()
 time.sleep(600)
 " 2> "$D/squatter.log" &
 SQUATTER=$!
+HELPER_PIDS="$HELPER_PIDS $SQUATTER"
 sleep 2
 
 run_until_exit "$D" 8093 8103 8203 240
@@ -386,16 +409,38 @@ if [ -n "$BACKUP_FILE" ]; then
     "no $ADMIN_EMAIL behind the API key after the restore"
   stop_node "$G"
 
-  # Corrupt restore input must be refused, and must not destroy what is on disk.
-  H="$WORK/h-bad-restore"; mkdir -p "$H"; cp "$CONFIG_TEMPLATE" "$H/config.toml"
+  # Corrupt restore input must be refused, and must not destroy what the node already has.
+  #
+  # The state that has to survive is the *restoring node's own*, so this node is populated first
+  # and the bad restore is aimed at the directory it owns. Pointing a doomed restore at an empty
+  # directory and then checking some other node's file would pass no matter what happened.
+  H="$WORK/h-bad-restore"; mkdir -p "$H"
+  start_node "$H" 8097 8107 8207
+  wait_ready "$H" 8097 300
+  assert "the node that will refuse a bad restore is populated first" $? "see $H/rauthy.log"
+  KID_H="$(jwks_kid 8097)"
+  stop_node "$H"
+  sleep 3
+
   head -c 4096 "$BACKUP_FILE" > "$H/truncated.sqlite"
-  BEFORE_SUM="$(sha256_of "$BACKUP_FILE")"
-  run_until_exit "$H" 8097 8107 8207 240 "HQL_BACKUP_RESTORE=file:$H/truncated.sqlite"
+  mv "$H/rauthy.log" "$H/first-run.log"
+  run_until_exit "$H" 8097 8107 8207 300 "HQL_BACKUP_RESTORE=file:$H/truncated.sqlite"
   RC=$?
   [ "$RC" -ne 0 ]
   assert "a truncated restore input is refused" $? "exit code was $RC"
-  [ "$(sha256_of "$BACKUP_FILE")" = "$BEFORE_SUM" ]
-  assert "the refused restore did not touch the last recoverable state" $?
+
+  mv "$H/rauthy.log" "$H/refused-restore.log"
+  start_node "$H" 8097 8107 8207
+  wait_ready "$H" 8097 300
+  assert "the node still starts on its own data after refusing the restore" $? \
+    "see $H/rauthy.log"
+  ! grep -q "Initializing empty production database" "$H/rauthy.log"
+  assert "the refused restore did not empty the node's database" $? \
+    "$(grep -n 'Initializing empty production database' "$H/rauthy.log" | head -1)"
+  [ "$(jwks_kid 8097)" = "$KID_H" ]
+  assert "the refused restore did not touch the last recoverable state" $? \
+    "before: $KID_H after: $(jwks_kid 8097)"
+  stop_node "$H"
 
   I="$WORK/i-missing-restore"; mkdir -p "$I"; cp "$CONFIG_TEMPLATE" "$I/config.toml"
   run_until_exit "$I" 8098 8108 8208 240 "HQL_BACKUP_RESTORE=file:$I/does-not-exist.sqlite"
@@ -502,6 +547,7 @@ sys.stderr.write('bound\n'); sys.stderr.flush()
 time.sleep(600)
 " 2> "$L/squatter.log" &
 SQUATTER=$!
+HELPER_PIDS="$HELPER_PIDS $SQUATTER"
 sleep 2
 
 run_until_exit "$L" 8089 8119 8219 240 METRICS_ENABLE=true METRICS_ADDR=127.0.0.1 METRICS_PORT=9090
@@ -540,6 +586,7 @@ else
   # like from the caller's side. The Hiqlite backend has no equivalent injection point from
   # outside the process.
   PGC="rauthy-acceptance-pg"
+  HELPER_CONTAINERS="$HELPER_CONTAINERS $PGC"
   "$DOCKER" rm -f "$PGC" >/dev/null 2>&1
   "$DOCKER" run -d --name "$PGC" -e POSTGRES_USER=rauthy -e POSTGRES_PASSWORD=123SuperSafe \
     -e POSTGRES_DB=rauthy -p 5439:5432 docker.io/library/postgres:17.2-alpine >/dev/null 2>&1

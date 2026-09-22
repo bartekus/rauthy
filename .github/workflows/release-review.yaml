@@ -49,8 +49,16 @@ jobs:
           # `contents: read` and `pull-requests: write`, and nothing that could publish.
           claude_args: '--allowedTools "Bash,Read,Grep,Glob"'
           prompt: |
-            Review this pull request against the tag `v0.36.2`, which is the upstream release it
-            is based on: `git diff v0.36.2...HEAD`.
+            Review this pull request against the upstream release it is based on, which is
+            upstream's `v0.36.2` at commit `dd61ac3c84d6b238108dc8438b53043b5177a662`:
+
+            ```
+            git diff dd61ac3c84d6b238108dc8438b53043b5177a662...HEAD
+            ```
+
+            Use the commit, not the tag. That tag lives in the upstream repository; this fork
+            does not carry it, and this release line deliberately does not republish upstream's
+            release tags under its own name.
 
             This is a downstream patched distribution of Rauthy, an identity provider. Report
             concrete defects with a file and line, and say plainly when a concern does not hold.

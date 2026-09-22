@@ -363,6 +363,31 @@ noted that the new S3 error branch put a raw object-store error into the respons
 the conversion this ledger vetted for credential safety; the cause now goes to the log and the
 client gets a message without it.
 
+Round six returned a clean verdict on the product code and four findings in the verification
+harness itself, two of which were the serious kind: assertions the ledger cited as evidence that
+could not fail.
+
+- `grep -qv PATTERN file` is not "PATTERN is absent from file". It succeeds as soon as any one
+  line lacks the pattern, which is true of every multi-line log. The credential-safety assertion
+  was therefore vacuous. Confirmed on GNU grep, which is what CI runs: it returns 0 whether or
+  not the secret is present. It is `! grep -q` now, against a distinctive sentinel rather than
+  the word `nothing`, which would have been indistinguishable from ordinary log prose anyway.
+- The restore-refusal leg aimed a doomed restore at an empty directory and then checked that a
+  *different* node's backup file was unchanged, which was true no matter what happened. The state
+  that has to survive is the restoring node's own, so that node is populated first, the bad
+  restore is aimed at the directory it owns, and the assertions are that it still starts on its
+  own data, did not re-bootstrap, and kept its signing keys.
+- The exit trap tracked only node PIDs, so a cancelled run leaked the port squatters and the
+  Postgres container onto a reused runner. It tracks both now, and fires on `INT` and `TERM` as
+  well as `EXIT`.
+- The review workflow told its own reviewer to `git diff v0.36.2...HEAD`, and this fork carries
+  no tags at all: that tag is upstream's, and this release line deliberately does not republish
+  upstream release tags under its own name. The prompt names the commit now.
+
+Two of those four are the same failure this ledger keeps being caught by, one level down: a claim
+resting on something that does not actually check it. A test that cannot fail is worse than no
+test, because it is cited as evidence.
+
 Round five returned a clean verdict and one narrow observation it explicitly did not call a
 defect: `get_backup_local` read the file's length once and committed to it as `Content-Length`, so
 a file that grew mid-download would have framed the response wrongly. Nothing appends to a

@@ -1,8 +1,18 @@
 # Promotes an already tested release candidate.
 #
 # This workflow builds no code. It takes the exact binaries a release-candidate run produced,
-# packages them into the image, pushes that image, and creates the GitHub release from the same
-# bytes. Rebuilding here would publish something no acceptance run ever saw.
+# packages them into the image, pushes that image, verifies it on both architectures, and only
+# then creates the GitHub release from the same bytes. Rebuilding here would publish something no
+# acceptance run ever saw.
+#
+# Four jobs, and each holds only what its step needs:
+#
+#   gate     reads. Decides whether the named candidate run may be promoted at all.
+#   image    the only job that can write to the registry. Holds no `contents: write`.
+#   verify   reads the registry, on a native runner per architecture.
+#   release  the only job that can create a tag. Holds no registry write.
+#
+# No job references CARGO_REGISTRY_TOKEN or the review credential.
 name: release publish
 
 on:
@@ -22,22 +32,41 @@ env:
   # Recorded in the provenance; kept in step with release-candidate.yaml.
   RUST_VERSION: '1.95.0'
   BUILD_IMAGE: 'rust:1.95.0-bookworm'
+  CANDIDATE_WORKFLOW: '.github/workflows/release-candidate.yaml'
+  REVIEW_WORKFLOW: 'release-review.yaml'
 
 jobs:
-  publish:
-    name: publish image and release
+  gate:
+    name: the candidate may be promoted
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      packages: write
-      attestations: write
-      id-token: write
-      # Downloading artifacts from another workflow run needs this; nothing else does.
+      contents: read
       actions: read
+      pull-requests: read
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      upstream_base: ${{ steps.identity.outputs.upstream_base }}
+      upstream_commit: ${{ steps.identity.outputs.upstream_commit }}
+      reviewed_pr: ${{ steps.review.outputs.pr }}
+      reviewed_head: ${{ steps.review.outputs.head }}
+      review_run: ${{ steps.review.outputs.run }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A release is cut from the reviewed release line, never from a work branch: that is where
+      # a reviewed pull request lands.
+      - name: Publication runs on a release line
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/patched/*) echo "release line: ${GITHUB_REF#refs/heads/}" ;;
+            *) echo "publish from a patched/* branch, not $GITHUB_REF" >&2; exit 1 ;;
+          esac
 
       - name: The version being published must be the version in the tree
+        id: identity
         run: |
           set -euo pipefail
           in_tree="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
@@ -45,11 +74,11 @@ jobs:
             echo "Cargo.toml declares $in_tree, the run asks to publish ${{ inputs.version }}" >&2
             exit 1
           fi
-          echo "version=$in_tree" >> "$GITHUB_ENV"
+          echo "version=$in_tree" >> "$GITHUB_OUTPUT"
           echo "upstream_base=$(grep -m1 'RAUTHY_UPSTREAM_BASE: &str' src/common/src/constants.rs \
-            | cut -d'"' -f2)" >> "$GITHUB_ENV"
+            | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
           echo "upstream_commit=$(grep -m1 'RAUTHY_UPSTREAM_COMMIT: &str' \
-            src/common/src/constants.rs | cut -d'"' -f2)" >> "$GITHUB_ENV"
+            src/common/src/constants.rs | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
 
       # The whole point of this release line is to consume published patched Hiqlite packages. A
       # path dependency, a git branch, or an inherited `[patch.crates-io]` override would resolve
@@ -63,27 +92,177 @@ jobs:
             echo "Cargo.toml still carries an active [patch.crates-io] entry for hiqlite" >&2
             exit 1
           fi
-          python3 - <<'PYEOF'
-          import re, sys
+          python3 assets/release/check_graph.py Cargo.lock
 
-          bad = []
-          found = 0
-          for block in open("Cargo.lock").read().split("[[package]]"):
-              name = re.search(r'^name = "(hiqlite[^"]*)"', block, re.M)
-              if not name:
-                  continue
-              found += 1
-              source = re.search(r'^source = "([^"]+)"', block, re.M)
-              if not source or not source.group(1).startswith("registry+"):
-                  bad.append((name.group(1), source.group(1) if source else "path (workspace)"))
-          if not found:
-              sys.exit("Cargo.lock resolves no hiqlite package at all")
-          if bad:
-              for name, src in bad:
-                  print(f"{name} resolves to {src}", file=sys.stderr)
-              sys.exit("a release must resolve published registry packages")
-          print(f"all {found} hiqlite packages resolve to a registry")
+      # A run id is an input anyone with dispatch rights can type. Nothing about the artifacts
+      # behind it is trusted until the run itself is shown to be the right workflow, from this
+      # repository, on this exact commit, green on its first attempt, with every job it is
+      # supposed to have.
+      - name: The candidate run is the right run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > run.json
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --jq '.jobs[] | {name, conclusion}' > jobs.jsonl
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          run = json.load(open("run.json"))
+          jobs = [json.loads(l) for l in open("jobs.jsonl") if l.strip()]
+          repo, sha = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]
+          problems = []
+
+          def want(what, got, expected):
+              if got != expected:
+                  problems.append(f"{what}: {got!r}, expected {expected!r}")
+
+          want("repository", run["repository"]["full_name"], repo)
+          want("head repository", (run.get("head_repository") or {}).get("full_name"), repo)
+          want("workflow", run["path"].split("@")[0], os.environ["CANDIDATE_WORKFLOW"])
+          want("commit", run["head_sha"], sha)
+          want("status", run["status"], "completed")
+          want("conclusion", run["conclusion"], "success")
+          # A rerun can turn a red job green without anything having changed. The first attempt
+          # is the only one that says the candidate passed on its own.
+          want("attempt", run["run_attempt"], 1)
+          if run["event"] not in ("push", "workflow_dispatch"):
+              problems.append(f"event: {run['event']!r}, expected push or workflow_dispatch")
+
+          required = {
+              "frontend and wasm", "style and unit checks", "dependency graph",
+              "integration suite (hiqlite)", "integration suite (postgres)",
+              "release binary (amd64)", "release binary (arm64)",
+              "acceptance (amd64)", "acceptance (arm64)", "consumer (rahi live suite)",
+          }
+          by_name = {j["name"]: j["conclusion"] for j in jobs}
+          for name in sorted(required):
+              want(f"job '{name}'", by_name.get(name, "absent"), "success")
+          for name, conclusion in sorted(by_name.items()):
+              if conclusion != "success":
+                  problems.append(f"job '{name}' concluded {conclusion}")
+
+          if problems:
+              print("the candidate run cannot be promoted:", file=sys.stderr)
+              for p in problems:
+                  print(f"  - {p}", file=sys.stderr)
+              sys.exit(1)
+          print(f"run {run['id']} is {os.environ['CANDIDATE_WORKFLOW']} on {sha}, "
+                f"attempt 1, {len(jobs)} jobs, all green")
           PYEOF
+
+      - name: Fetch what the candidate recorded
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '{acceptance-result-*,candidate-manifest-*}'
+          path: recorded
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+
+      # A green job is not the same claim as a clean acceptance. The harness writes its own
+      # counts, and a publication candidate must have run strict, on both architectures, with
+      # nothing failed and nothing skipped. The manifest ties the binaries to this commit and to
+      # this lock file.
+      - name: The candidate qualified this tree
+        run: |
+          set -euo pipefail
+          lock_sha="$(sha256sum Cargo.lock | cut -d' ' -f1)"
+          LOCK_SHA="$lock_sha" python3 - <<'PYEOF'
+          import glob, json, os, sys
+
+          problems = []
+          for arch in ("amd64", "arm64"):
+              res = glob.glob(f"recorded/acceptance-result-{arch}/acceptance-result.json")
+              man = glob.glob(f"recorded/candidate-manifest-{arch}/candidate-manifest.json")
+              if not res:
+                  problems.append(f"{arch}: no acceptance result")
+              else:
+                  r = json.load(open(res[0]))
+                  if not (r.get("strict") is True and r.get("failed") == 0
+                          and r.get("skipped") == 0 and r.get("passed", 0) > 0):
+                      problems.append(f"{arch}: acceptance {r}")
+                  else:
+                      print(f"{arch}: {r['passed']} passed, 0 failed, 0 skipped, strict")
+              if not man:
+                  problems.append(f"{arch}: no candidate manifest")
+              else:
+                  m = json.load(open(man[0]))
+                  if m.get("commit") != os.environ["GITHUB_SHA"]:
+                      problems.append(f"{arch}: built from {m.get('commit')}")
+                  if m.get("cargo_lock_sha256") != os.environ["LOCK_SHA"]:
+                      problems.append(f"{arch}: built against a different Cargo.lock")
+                  if m.get("registry_graph") is not True:
+                      problems.append(f"{arch}: the build graph was not registry-only")
+          if problems:
+              print("the candidate did not qualify this tree:", file=sys.stderr)
+              for p in problems:
+                  print(f"  - {p}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+      # The published commit must be one a reviewed pull request produced, and the review must
+      # have run on that pull request's exact head. The tree comparison is what lets a merge
+      # commit stand for the head it merged: the bytes are the same, so the review covers them.
+      - name: The source was reviewed
+        id: review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq "[.[] | select(.merged_at != null and .merge_commit_sha == \"$GITHUB_SHA\"
+                   and (.base.ref | startswith(\"patched/\")))][0].number // empty")"
+          if [ -z "$pr" ]; then
+            echo "$GITHUB_SHA is not the merge commit of a pull request into patched/*" >&2
+            exit 1
+          fi
+          head="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq .head.sha)"
+          if [ "$(git rev-parse "$head^{tree}")" != "$(git rev-parse "$GITHUB_SHA^{tree}")" ]; then
+            echo "the merge of #$pr does not carry the tree its reviewed head had" >&2
+            exit 1
+          fi
+          review_run="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$REVIEW_WORKFLOW/runs?head_sha=$head&status=success" \
+            --jq '.workflow_runs[0].id // empty')"
+          if [ -z "$review_run" ]; then
+            echo "no successful $REVIEW_WORKFLOW run on the reviewed head $head of #$pr" >&2
+            exit 1
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "run=$review_run" >> "$GITHUB_OUTPUT"
+          echo "reviewed: #$pr at $head, review run $review_run, same tree as $GITHUB_SHA"
+
+      # A published tag is immutable, in the registry and in git.
+      - name: Refuse to move a published identity
+        env:
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" > /dev/null; then
+            echo "tag v$VERSION already exists; pick a new patch level" >&2
+            exit 1
+          fi
+          echo "v$VERSION is free in git"
+
+  image:
+    name: push and attest the image
+    runs-on: ubuntu-latest
+    needs: gate
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+      actions: read
+    outputs:
+      index_digest: ${{ steps.push.outputs.index_digest }}
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -93,17 +272,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      # A published tag is immutable. Moving one would change what a consumer's digest pin means
-      # relative to the tag they wrote down, so a tag that already exists stops the run. The
-      # registry login above has to come first, or a private package would look absent.
+      # The registry login has to come first, or a private package would look absent.
       - name: Refuse to move a published tag
         run: |
           set -euo pipefail
-          if docker manifest inspect "$IMAGE:$version" > /dev/null 2>&1; then
-            echo "$IMAGE:$version is already published; pick a new patch level" >&2
+          if docker manifest inspect "$IMAGE:$VERSION" > /dev/null 2>&1; then
+            echo "$IMAGE:$VERSION is already published; pick a new patch level" >&2
             exit 1
           fi
-          echo "$IMAGE:$version is free"
+          echo "$IMAGE:$VERSION is free"
 
       - name: Fetch the tested binaries
         uses: actions/download-artifact@v4
@@ -128,13 +305,13 @@ jobs:
           set -euxo pipefail
           docker buildx build \
             --build-arg CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --build-arg VERSION="$version" \
+            --build-arg VERSION="$VERSION" \
             --build-arg REVISION="${{ github.sha }}" \
-            --build-arg UPSTREAM_BASE="$upstream_base" \
-            --build-arg UPSTREAM_COMMIT="$upstream_commit" \
+            --build-arg UPSTREAM_BASE="${{ needs.gate.outputs.upstream_base }}" \
+            --build-arg UPSTREAM_COMMIT="${{ needs.gate.outputs.upstream_commit }}" \
             --platform linux/amd64,linux/arm64 \
             --provenance=true --sbom=true \
-            -t "$IMAGE:$version" \
+            -t "$IMAGE:$VERSION" \
             --metadata-file buildx-metadata.json \
             --push .
 
@@ -142,10 +319,10 @@ jobs:
           # a second, weaker source for the same fact.
           index_digest="$(python3 -c \
             'import json;print(json.load(open("buildx-metadata.json"))["containerimage.digest"])')"
-          echo "index_digest=$index_digest" >> "$GITHUB_ENV"
           echo "index_digest=$index_digest" >> "$GITHUB_OUTPUT"
 
           docker buildx imagetools inspect "$IMAGE@$index_digest" > image-index.txt
+          docker buildx imagetools inspect --raw "$IMAGE@$index_digest" > image-index.json
           cat image-index.txt
 
       - uses: actions/attest-build-provenance@v2
@@ -154,39 +331,155 @@ jobs:
           subject-digest: ${{ steps.push.outputs.index_digest }}
           push-to-registry: true
 
-      - name: Verify the published image before announcing it
+      - uses: actions/upload-artifact@v4
+        with:
+          name: published-image
+          path: |
+            image-index.txt
+            image-index.json
+          retention-days: 30
+
+  verify:
+    name: verify the published image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [gate, image]
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      DIGEST: ${{ needs.image.outputs.index_digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Fetch the tested binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rauthy-${{ matrix.arch }}
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+
+      # Natively on each architecture, by digest: the form a consumer pins, and the only way to
+      # execute the arm64 image without an emulator standing in for the hardware.
+      - name: The image carries the tested bytes and runs
         run: |
           set -euxo pipefail
-          # Pull by digest, not by tag: this proves the digest recorded above is the one that
-          # carries the bytes, and it is the form the consumer pins.
-          docker pull "$IMAGE@$index_digest"
-          for arch in amd64 arm64; do
-            id="$(docker create --platform "linux/$arch" "$IMAGE@$index_digest")"
-            docker cp "$id:/app/rauthy" "./pulled_$arch"
-            docker rm "$id" > /dev/null
-            # The image must carry the very bytes that were tested.
-            diff <(sha256sum < "./pulled_$arch") <(sha256sum < "rauthy_$arch") \
-              || { echo "the $arch image does not carry the tested binary" >&2; exit 1; }
+          ref="$IMAGE@$DIGEST"
+          docker pull --platform "linux/${{ matrix.arch }}" "$ref"
+          [ "$(docker image inspect "$ref" --format '{{.Architecture}}')" = "${{ matrix.arch }}" ]
+          id="$(docker create --platform "linux/${{ matrix.arch }}" "$ref")"
+          docker cp "$id:/app/rauthy" ./pulled
+          docker cp "$id:/app/LICENSE" ./pulled-LICENSE
+          docker rm "$id" > /dev/null
+          diff <(sha256sum < ./pulled) <(sha256sum < "rauthy_${{ matrix.arch }}") \
+            || { echo "the image does not carry the tested binary" >&2; exit 1; }
+          cmp ./pulled-LICENSE LICENSE
+          docker run --rm "$ref" --version | tee version.txt
+          grep -q "rauthy $VERSION" version.txt
+          labels="$(docker image inspect "$ref" --format '{{json .Config.Labels}}')"
+          echo "$labels" | python3 -c '
+          import json, sys
+          l = json.load(sys.stdin)
+          want = {
+              "org.opencontainers.image.source": "https://github.com/bartekus/rauthy",
+              "org.opencontainers.image.version": sys.argv[1],
+              "org.opencontainers.image.licenses": "Apache-2.0",
+              "org.rauthy.patched.upstream.repository": "https://github.com/sebadob/rauthy",
+          }
+          bad = {k: (l.get(k), v) for k, v in want.items() if l.get(k) != v}
+          assert not bad, bad
+          assert "Not an upstream release" in l["org.opencontainers.image.description"]
+          print("labels ok")
+          ' "$VERSION"
+
+      # The same shape a consumer runs: the image's own entrypoint, its own non-root user and
+      # data directory, configured through the environment only.
+      - name: The image starts, serves and shuts down cleanly
+        run: |
+          set -euo pipefail
+          : > empty-config.toml
+          docker run -d --name smoke -p 8080:8080 \
+            -v "$PWD/empty-config.toml:/app/config.toml:ro" \
+            -e PUB_URL=localhost:8080 -e LISTEN_SCHEME=http -e LISTEN_PORT_HTTP=8080 \
+            -e RP_ID=localhost -e RP_ORIGIN=http://localhost:8080 -e RP_NAME=smoke \
+            -e HQL_NODE_ID=1 -e 'HQL_NODES=1 127.0.0.1:8100 127.0.0.1:8200' \
+            -e HQL_SECRET_RAFT=SmokeRaftSecret0123456789abcdefghijklmnopqrstuvwxyz0123456789 \
+            -e HQL_SECRET_API=SmokeApiSecret0123456789abcdefghijklmnopqrstuvwxyz0123456789 \
+            -e ENC_KEYS=smoke/9/KslT9sVWd0aEnR9e0AVrd4aTue/etZIqCm4PsjsnU= -e ENC_KEY_ACTIVE=smoke \
+            "$IMAGE@$DIGEST"
+          ok=0
+          for _ in $(seq 1 180); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/auth/v1/ready)" = "200" ]; then
+              ok=1; break
+            fi
+            sleep 1
           done
-          # The runner is amd64, so only that one can be executed here.
-          chmod +x ./pulled_amd64
-          ./pulled_amd64 --version | grep -q "$version"
+          docker logs smoke > smoke.log 2>&1 || true
+          [ "$ok" = 1 ] || { cat smoke.log; echo "the image did not become ready" >&2; exit 1; }
+          curl -s http://localhost:8080/auth/v1/health | grep -q '"db_healthy":true'
+          grep -q "Downstream distribution by" smoke.log
+          docker stop -t 60 smoke > /dev/null
+          [ "$(docker inspect smoke --format '{{.State.ExitCode}}')" = "0" ]
+          docker logs smoke 2>&1 | grep -q "Shutdown complete"
+          docker rm smoke > /dev/null
+          echo "${{ matrix.arch }}: pulled by digest, tested bytes, starts, ready, clean shutdown"
+
+  release:
+    name: create the release
+    runs-on: ubuntu-latest
+    needs: [gate, image, verify]
+    permissions:
+      contents: write
+      actions: read
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      index_digest: ${{ needs.image.outputs.index_digest }}
+      upstream_base: ${{ needs.gate.outputs.upstream_base }}
+      upstream_commit: ${{ needs.gate.outputs.upstream_commit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the tested binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rauthy-*
+          merge-multiple: true
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: published-image
 
       - name: Collect the checksums
         run: |
           set -euxo pipefail
+          sha256sum -c rauthy_amd64.sha256
+          sha256sum -c rauthy_arm64.sha256
           sha256sum rauthy_amd64 rauthy_arm64 > SHA256SUMS
           cat SHA256SUMS
 
-      # The consumer handoff carries an empty table on purpose: these values do not exist until
-      # something is actually published. This step fills them in from what was published, so the
-      # numbers a consumer pins come from the publish run rather than from a document someone
-      # updated by hand.
+      # The consumer handoff says to pin from this file, because these values do not exist until
+      # something is actually published. It is written from what was published.
       - name: Write the provenance
         run: |
           set -euo pipefail
           {
-            echo "# Provenance: Rauthy $version"
+            echo "# Provenance: Rauthy $VERSION"
             echo
             echo "Generated by the publish run, from what was actually published."
             echo
@@ -194,22 +487,36 @@ jobs:
             echo
             echo "| | |"
             echo "|---|---|"
-            echo "| Version | \`$version\` |"
+            echo "| Version | \`$VERSION\` |"
             echo "| Upstream base | \`$upstream_base\` = \`$upstream_commit\` |"
             echo "| Source commit | \`${{ github.sha }}\` |"
-            echo "| Image | \`$IMAGE:$version\` |"
+            echo "| Reviewed pull request | #${{ needs.gate.outputs.reviewed_pr }} at \`${{ needs.gate.outputs.reviewed_head }}\` |"
+            echo "| Review run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ needs.gate.outputs.review_run }} |"
+            echo "| Image | \`$IMAGE:$VERSION\` |"
             echo "| Image index digest | \`$index_digest\` |"
             echo "| Toolchain | \`$BUILD_IMAGE\` (rust $RUST_VERSION) |"
-            echo "| Run | \`${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\` |"
-            echo "| Tested candidate run | \`${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.candidate_run_id }}\` |"
+            echo "| Cargo.lock sha256 | \`$(sha256sum Cargo.lock | cut -d' ' -f1)\` |"
+            echo "| Publish run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |"
+            echo "| Tested candidate run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.candidate_run_id }} |"
             echo
             echo "Pin by digest:"
             echo
             echo '```'
-            echo "$IMAGE:$version@$index_digest"
+            echo "$IMAGE:$VERSION@$index_digest"
             echo '```'
             echo
             echo "## Per-platform manifests"
+            echo
+            echo "| Platform | Manifest digest |"
+            echo "|---|---|"
+            python3 -c '
+          import json
+          for m in json.load(open("image-index.json"))["manifests"]:
+              p = m.get("platform", {})
+              if p.get("os") == "unknown":
+                  continue  # attestation manifests, not a runnable platform
+              print("| `{}/{}` | `{}` |".format(p.get("os"), p.get("architecture"), m["digest"]))
+          '
             echo
             echo '```'
             cat image-index.txt
@@ -223,26 +530,7 @@ jobs:
             echo
             echo "## Resolved Hiqlite packages"
             echo
-            echo "| Package | Version | Source | Checksum |"
-            echo "|---|---|---|---|"
-            python3 - <<'PYEOF'
-          import re
-
-          lock = open("Cargo.lock").read()
-          for block in lock.split("[[package]]"):
-              name = re.search(r'^name = "(hiqlite[^"]*)"', block, re.M)
-              if not name:
-                  continue
-              version = re.search(r'^version = "([^"]+)"', block, re.M)
-              source = re.search(r'^source = "([^"]+)"', block, re.M)
-              checksum = re.search(r'^checksum = "([^"]+)"', block, re.M)
-              print("| `{}` | `{}` | {} | `{}` |".format(
-                  name.group(1),
-                  version.group(1) if version else "?",
-                  "`" + source.group(1) + "`" if source else "**path or git, not a registry**",
-                  checksum.group(1) if checksum else "none",
-              ))
-          PYEOF
+            python3 assets/release/check_graph.py --table Cargo.lock
             echo
             echo "## Reproducibility"
             echo
@@ -258,35 +546,38 @@ jobs:
           set -euxo pipefail
           {
             echo "Downstream patched build of Rauthy. **Not an upstream release** and not endorsed"
-            echo "by or supported by the upstream project."
+            echo "by or supported by the upstream project. Upstream's authorship and Apache-2.0"
+            echo "licence are unchanged; \`LICENSE\` is attached and shipped in the image."
             echo
             echo "| | |"
             echo "|---|---|"
             echo "| Upstream base | \`$upstream_base\` (\`$upstream_commit\`) |"
             echo "| Source commit | \`${{ github.sha }}\` |"
-            echo "| Image | \`$IMAGE:$version\` |"
+            echo "| Image | \`$IMAGE:$VERSION\` |"
             echo "| Image index digest | \`$index_digest\` |"
+            echo "| Supported topology | N = 1 |"
             echo
             echo "Pin by digest:"
             echo
             echo '```'
-            echo "$IMAGE:$version@$index_digest"
+            echo "$IMAGE:$VERSION@$index_digest"
             echo '```'
             echo
-            echo "\`RELEASE-PROVENANCE.md\` is attached and carries the per-platform digests,"
-            echo "the binary checksums, the resolved Hiqlite packages and the toolchain."
-            echo "\`RELEASE-LEDGER.md\` and \`RELEASE-HANDOFF.md\` are attached too."
+            echo "\`RELEASE-PROVENANCE.md\` carries the per-platform digests, the binary checksums,"
+            echo "the resolved Hiqlite packages, the toolchain and the runs. \`RELEASE-LEDGER.md\`"
+            echo "is the patch inventory and the evidence; \`RELEASE-HANDOFF.md\` is what a consumer"
+            echo "needs to adopt it."
           } > notes.md
 
-          if gh release view "v$version" > /dev/null 2>&1; then
-            echo "release v$version already exists; published releases are never replaced" >&2
+          if gh release view "v$VERSION" > /dev/null 2>&1; then
+            echo "release v$VERSION already exists; published releases are never replaced" >&2
             exit 1
           fi
-          gh release create "v$version" \
+          gh release create "v$VERSION" \
             --target "${{ github.sha }}" \
-            --title "Rauthy v$version (downstream patched)" \
+            --title "Rauthy v$VERSION (downstream patched)" \
             --notes-file notes.md \
-            rauthy_amd64 rauthy_arm64 SHA256SUMS image-index.txt \
+            rauthy_amd64 rauthy_arm64 SHA256SUMS image-index.txt LICENSE \
             RELEASE-PROVENANCE.md RELEASE-LEDGER.md RELEASE-HANDOFF.md
 
       # A package pushed by a workflow token is private by default, and a private package is not
@@ -318,7 +609,7 @@ jobs:
             echo "## Published"
             echo
             echo '```'
-            echo "$IMAGE:$version@$index_digest"
+            echo "$IMAGE:$VERSION@$index_digest"
             echo '```'
             echo
             if [ "${{ steps.anon.outputs.public }}" = "true" ]; then
@@ -330,7 +621,5 @@ jobs:
               echo
               echo "> https://github.com/users/bartekus/packages/container/rauthy-patched/settings"
               echo "> -> Change package visibility -> Public"
-              echo
-              echo "Everything else is done; this is the only remaining step."
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"

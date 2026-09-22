@@ -42,6 +42,8 @@ WORKDIR /app
 
 COPY --chown=$TARGET_USER ./out/rauthy_$TARGETARCH ./rauthy
 COPY --chown=$TARGET_USER ./config-local-test.toml ./config-local-test.toml
+# Apache-2.0 requires a copy of the licence with every redistribution, and an image is one.
+COPY --chown=$TARGET_USER ./LICENSE ./LICENSE
 
 # we are copying the empty dirs for proper access rights upfront
 COPY --chown=$TARGET_USER ./out/empty/ ./data

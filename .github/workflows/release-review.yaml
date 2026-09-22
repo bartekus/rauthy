@@ -98,10 +98,19 @@ jobs:
             what the consumer is told. Treat a claim in either that the code does not support as a
             finding in its own right.
 
-            End with a one-line verdict: whether you found anything that should block this
-            release. Do not try to post anything yourself: the step after this one takes your
-            final answer and publishes it, so that the review is on the record whether or not you
-            think to put it there.
+            Work in the foreground only. Do not start background tasks and do not wait for
+            notifications: nothing will arrive, and a review that ends while waiting has no
+            verdict.
+
+            The last line of your final answer must be exactly one of these two, and nothing may
+            follow it:
+
+            VERDICT: no blocking findings
+            VERDICT: blocking findings
+
+            Do not try to post anything yourself: the step after this one takes your final answer
+            and publishes it, so that the review is on the record whether or not you think to put
+            it there.
 
       # The first review run finished cleanly and left nothing behind: no comment, no job summary,
       # and the execution log stays on the runner. Publishing the verdict is therefore this
@@ -160,6 +169,16 @@ jobs:
           if [ -n "$PR_NUMBER" ]; then
             gh pr review "$PR_NUMBER" --comment --body-file review.md
           fi
+          # The publish gate accepts a successful run of this workflow on the reviewed head, so a
+          # success must mean a verdict. A reviewer that ended without one (observed: a final
+          # answer of "Still running") or with a blocking one fails the run.
+          verdict="$(grep -E '^VERDICT: ' review.md | tail -1 || true)"
+          echo "verdict line: ${verdict:-none}"
+          case "$verdict" in
+            "VERDICT: no blocking findings") ;;
+            "VERDICT: blocking findings") echo "the review found blocking findings" >&2; exit 1 ;;
+            *) echo "the review produced no verdict" >&2; exit 1 ;;
+          esac
 
       - uses: actions/upload-artifact@v4
         if: always() && steps.review.outputs.execution_file != ''

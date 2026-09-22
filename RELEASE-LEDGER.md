@@ -346,6 +346,13 @@ now compares the node's own keys, taken before the second process's attempt. One
 review is inaccurate and changes nothing: it calls `/health` unconditional, but it answers `500`
 when storage is unhealthy (acceptance K and P assert that).
 
+**Round 9** (review run `35782723382`, head `43aa3aeb`) concluded `success` and produced no
+verdict: the reviewer's final answer was that it was still running and would wait for
+notifications. That exposed a gap in the gate, which accepted any successful review run. The
+review workflow now requires the final line to be `VERDICT: no blocking findings` or
+`VERDICT: blocking findings` and fails the run on a missing or blocking verdict, so a successful
+run means a non-blocking verdict. Round 9 counts as no review.
+
 The final head, carrying the registry graph, gets its own review round before merge; the publish
 gate requires a successful review run on that exact head.
 

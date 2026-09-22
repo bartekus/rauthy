@@ -1,0 +1,336 @@
+# Promotes an already tested release candidate.
+#
+# This workflow builds no code. It takes the exact binaries a release-candidate run produced,
+# packages them into the image, pushes that image, and creates the GitHub release from the same
+# bytes. Rebuilding here would publish something no acceptance run ever saw.
+name: release publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: 'Run id of the release-candidate workflow whose artifacts to promote'
+        required: true
+      version:
+        description: 'The version to publish, e.g. 0.36.2-patched.1. Must match Cargo.toml.'
+        required: true
+
+permissions: {}
+
+env:
+  IMAGE: ghcr.io/bartekus/rauthy-patched
+  # Recorded in the provenance; kept in step with release-candidate.yaml.
+  RUST_VERSION: '1.95.0'
+  BUILD_IMAGE: 'rust:1.95.0-bookworm'
+
+jobs:
+  publish:
+    name: publish image and release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+      # Downloading artifacts from another workflow run needs this; nothing else does.
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The version being published must be the version in the tree
+        run: |
+          set -euo pipefail
+          in_tree="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$in_tree" != "${{ inputs.version }}" ]; then
+            echo "Cargo.toml declares $in_tree, the run asks to publish ${{ inputs.version }}" >&2
+            exit 1
+          fi
+          echo "version=$in_tree" >> "$GITHUB_ENV"
+          echo "upstream_base=$(grep -m1 'RAUTHY_UPSTREAM_BASE: &str' src/common/src/constants.rs \
+            | cut -d'"' -f2)" >> "$GITHUB_ENV"
+          echo "upstream_commit=$(grep -m1 'RAUTHY_UPSTREAM_COMMIT: &str' \
+            src/common/src/constants.rs | cut -d'"' -f2)" >> "$GITHUB_ENV"
+
+      # The whole point of this release line is to consume published patched Hiqlite packages. A
+      # path dependency, a git branch, or an inherited `[patch.crates-io]` override would resolve
+      # to something a consumer cannot obtain and cannot verify, and it would do so silently. This
+      # refuses to publish such a tree at all.
+      - name: Every Hiqlite package must come from a registry
+        run: |
+          set -euo pipefail
+          if grep -q '^\[patch\.crates-io\]' Cargo.toml && \
+             grep -A5 '^\[patch\.crates-io\]' Cargo.toml | grep -qE '^\s*hiqlite'; then
+            echo "Cargo.toml still carries an active [patch.crates-io] entry for hiqlite" >&2
+            exit 1
+          fi
+          python3 - <<'PYEOF'
+          import re, sys
+
+          bad = []
+          found = 0
+          for block in open("Cargo.lock").read().split("[[package]]"):
+              name = re.search(r'^name = "(hiqlite[^"]*)"', block, re.M)
+              if not name:
+                  continue
+              found += 1
+              source = re.search(r'^source = "([^"]+)"', block, re.M)
+              if not source or not source.group(1).startswith("registry+"):
+                  bad.append((name.group(1), source.group(1) if source else "path (workspace)"))
+          if not found:
+              sys.exit("Cargo.lock resolves no hiqlite package at all")
+          if bad:
+              for name, src in bad:
+                  print(f"{name} resolves to {src}", file=sys.stderr)
+              sys.exit("a release must resolve published registry packages")
+          print(f"all {found} hiqlite packages resolve to a registry")
+          PYEOF
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # A published tag is immutable. Moving one would change what a consumer's digest pin means
+      # relative to the tag they wrote down, so a tag that already exists stops the run. The
+      # registry login above has to come first, or a private package would look absent.
+      - name: Refuse to move a published tag
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "$IMAGE:$version" > /dev/null 2>&1; then
+            echo "$IMAGE:$version is already published; pick a new patch level" >&2
+            exit 1
+          fi
+          echo "$IMAGE:$version is free"
+
+      - name: Fetch the tested binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rauthy-*
+          merge-multiple: true
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify the binaries are the ones that were tested
+        run: |
+          set -euxo pipefail
+          sha256sum -c rauthy_amd64.sha256
+          sha256sum -c rauthy_arm64.sha256
+          mkdir -p out/empty
+          cp rauthy_amd64 rauthy_arm64 out/
+          chmod +x out/rauthy_amd64 out/rauthy_arm64
+
+      - name: Build and push the multi-architecture image
+        id: push
+        run: |
+          set -euxo pipefail
+          docker buildx build \
+            --build-arg CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg VERSION="$version" \
+            --build-arg REVISION="${{ github.sha }}" \
+            --build-arg UPSTREAM_BASE="$upstream_base" \
+            --build-arg UPSTREAM_COMMIT="$upstream_commit" \
+            --platform linux/amd64,linux/arm64 \
+            --provenance=true --sbom=true \
+            -t "$IMAGE:$version" \
+            --metadata-file buildx-metadata.json \
+            --push .
+
+          # buildx reports the digest of what it pushed; parsing an inspect template would be
+          # a second, weaker source for the same fact.
+          index_digest="$(python3 -c \
+            'import json;print(json.load(open("buildx-metadata.json"))["containerimage.digest"])')"
+          echo "index_digest=$index_digest" >> "$GITHUB_ENV"
+          echo "index_digest=$index_digest" >> "$GITHUB_OUTPUT"
+
+          docker buildx imagetools inspect "$IMAGE@$index_digest" > image-index.txt
+          cat image-index.txt
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.index_digest }}
+          push-to-registry: true
+
+      - name: Verify the published image before announcing it
+        run: |
+          set -euxo pipefail
+          # Pull by digest, not by tag: this proves the digest recorded above is the one that
+          # carries the bytes, and it is the form the consumer pins.
+          docker pull "$IMAGE@$index_digest"
+          for arch in amd64 arm64; do
+            id="$(docker create --platform "linux/$arch" "$IMAGE@$index_digest")"
+            docker cp "$id:/app/rauthy" "./pulled_$arch"
+            docker rm "$id" > /dev/null
+            # The image must carry the very bytes that were tested.
+            diff <(sha256sum < "./pulled_$arch") <(sha256sum < "rauthy_$arch") \
+              || { echo "the $arch image does not carry the tested binary" >&2; exit 1; }
+          done
+          # The runner is amd64, so only that one can be executed here.
+          chmod +x ./pulled_amd64
+          ./pulled_amd64 --version | grep -q "$version"
+
+      - name: Collect the checksums
+        run: |
+          set -euxo pipefail
+          sha256sum rauthy_amd64 rauthy_arm64 > SHA256SUMS
+          cat SHA256SUMS
+
+      # The consumer handoff carries an empty table on purpose: these values do not exist until
+      # something is actually published. This step fills them in from what was published, so the
+      # numbers a consumer pins come from the publish run rather than from a document someone
+      # updated by hand.
+      - name: Write the provenance
+        run: |
+          set -euo pipefail
+          {
+            echo "# Provenance: Rauthy $version"
+            echo
+            echo "Generated by the publish run, from what was actually published."
+            echo
+            echo "## Identity"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`$version\` |"
+            echo "| Upstream base | \`$upstream_base\` = \`$upstream_commit\` |"
+            echo "| Source commit | \`${{ github.sha }}\` |"
+            echo "| Image | \`$IMAGE:$version\` |"
+            echo "| Image index digest | \`$index_digest\` |"
+            echo "| Toolchain | \`$BUILD_IMAGE\` (rust $RUST_VERSION) |"
+            echo "| Run | \`${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\` |"
+            echo "| Tested candidate run | \`${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.candidate_run_id }}\` |"
+            echo
+            echo "Pin by digest:"
+            echo
+            echo '```'
+            echo "$IMAGE:$version@$index_digest"
+            echo '```'
+            echo
+            echo "## Per-platform manifests"
+            echo
+            echo '```'
+            cat image-index.txt
+            echo '```'
+            echo
+            echo "## Binary checksums (sha256)"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+            echo
+            echo "## Resolved Hiqlite packages"
+            echo
+            echo "| Package | Version | Source | Checksum |"
+            echo "|---|---|---|---|"
+            python3 - <<'PYEOF'
+          import re
+
+          lock = open("Cargo.lock").read()
+          for block in lock.split("[[package]]"):
+              name = re.search(r'^name = "(hiqlite[^"]*)"', block, re.M)
+              if not name:
+                  continue
+              version = re.search(r'^version = "([^"]+)"', block, re.M)
+              source = re.search(r'^source = "([^"]+)"', block, re.M)
+              checksum = re.search(r'^checksum = "([^"]+)"', block, re.M)
+              print("| `{}` | `{}` | {} | `{}` |".format(
+                  name.group(1),
+                  version.group(1) if version else "?",
+                  "`" + source.group(1) + "`" if source else "**path or git, not a registry**",
+                  checksum.group(1) if checksum else "none",
+              ))
+          PYEOF
+            echo
+            echo "## Reproducibility"
+            echo
+            echo "Not bit-for-bit reproducible, and not claimed to be: \`src/common/build.rs\`"
+            echo "stamps \`BUILD_TIME\` from the wall clock, so two builds of this tree differ."
+          } > RELEASE-PROVENANCE.md
+          cat RELEASE-PROVENANCE.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          {
+            echo "Downstream patched build of Rauthy. **Not an upstream release** and not endorsed"
+            echo "by or supported by the upstream project."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream base | \`$upstream_base\` (\`$upstream_commit\`) |"
+            echo "| Source commit | \`${{ github.sha }}\` |"
+            echo "| Image | \`$IMAGE:$version\` |"
+            echo "| Image index digest | \`$index_digest\` |"
+            echo
+            echo "Pin by digest:"
+            echo
+            echo '```'
+            echo "$IMAGE:$version@$index_digest"
+            echo '```'
+            echo
+            echo "\`RELEASE-PROVENANCE.md\` is attached and carries the per-platform digests,"
+            echo "the binary checksums, the resolved Hiqlite packages and the toolchain."
+            echo "\`RELEASE-LEDGER.md\` and \`RELEASE-HANDOFF.md\` are attached too."
+          } > notes.md
+
+          if gh release view "v$version" > /dev/null 2>&1; then
+            echo "release v$version already exists; published releases are never replaced" >&2
+            exit 1
+          fi
+          gh release create "v$version" \
+            --target "${{ github.sha }}" \
+            --title "Rauthy v$version (downstream patched)" \
+            --notes-file notes.md \
+            rauthy_amd64 rauthy_arm64 SHA256SUMS image-index.txt \
+            RELEASE-PROVENANCE.md RELEASE-LEDGER.md RELEASE-HANDOFF.md
+
+      # A package pushed by a workflow token is private by default, and a private package is not
+      # consumable however correct the release is. This asks the registry the way an outside
+      # consumer would: with an anonymous pull token and no credentials at all.
+      - name: Can it be pulled anonymously
+        id: anon
+        run: |
+          set -uo pipefail
+          repo="${IMAGE#ghcr.io/}"
+          token="$(curl -fsSL \
+            "https://ghcr.io/token?scope=repository:${repo}:pull&service=ghcr.io" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')"
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/${repo}/manifests/${index_digest}")"
+          echo "anonymous manifest fetch: HTTP $code"
+          if [ "$code" = "200" ]; then
+            echo "public=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "public=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report what remains
+        run: |
+          {
+            echo "## Published"
+            echo
+            echo '```'
+            echo "$IMAGE:$version@$index_digest"
+            echo '```'
+            echo
+            if [ "${{ steps.anon.outputs.public }}" = "true" ]; then
+              echo "The package is pullable anonymously. Nothing remains."
+            else
+              echo "**The package is not pullable anonymously.** The release is not consumable"
+              echo "until that changes, and changing it is an owner action that no workflow token"
+              echo "can perform:"
+              echo
+              echo "> https://github.com/users/bartekus/packages/container/rauthy-patched/settings"
+              echo "> -> Change package visibility -> Public"
+              echo
+              echo "Everything else is done; this is the only remaining step."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -40,6 +40,30 @@ pub static BUILD_TIME: LazyLock<DateTime<Utc>> = LazyLock::new(|| {
 });
 
 pub const RAUTHY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Who built these bytes.
+///
+/// This is a downstream distribution of Rauthy, not an upstream release. It carries upstream's
+/// sources and licence unchanged apart from the commits listed in `RELEASE-LEDGER.md`, and it is
+/// neither endorsed by nor supported by the upstream project. The constants below make that
+/// visible wherever the version is: the startup log, the image labels, and the release notes.
+pub const RAUTHY_DISTRIBUTOR: &str = "bartekus";
+
+/// The upstream release this distribution is built from.
+pub const RAUTHY_UPSTREAM_BASE: &str = "v0.36.2";
+
+/// The upstream commit `RAUTHY_UPSTREAM_BASE` resolves to.
+pub const RAUTHY_UPSTREAM_COMMIT: &str = "dd61ac3c84d6b238108dc8438b53043b5177a662";
+
+/// Where these bytes come from.
+pub const RAUTHY_SOURCE_URL: &str = "https://github.com/bartekus/rauthy";
+
+/// The config file path used when `--config-file` is not given.
+///
+/// A deployment may configure rauthy entirely through environment variables, so this file being
+/// absent is not an error. A path the operator named explicitly is a different matter: see
+/// `Vars::load`.
+pub const DEFAULT_CONFIG_PATH: &str = "./config.toml";
 pub static CONTENT_TYPE_WEBP: &str = "image/webp";
 pub static HEADER_DPOP_NONCE: &str = "DPoP-Nonce";
 pub static HEADER_ALLOW_ALL_ORIGINS: (&str, &str) = ("access-control-allow-origin", "*");

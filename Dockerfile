@@ -10,18 +10,28 @@ ARG TARGET_USER="10001:10001"
 
 ARG CREATED
 ARG VERSION
+ARG REVISION
+ARG UPSTREAM_BASE
+ARG UPSTREAM_COMMIT
 
+# Upstream authorship and licence are unchanged: this is a downstream build of upstream's sources.
 LABEL org.opencontainers.image.authors="Sebastian Dobe <sebastiandobe@mailbox.org>"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.documentation="https://sebadob.github.io/rauthy/"
 LABEL org.opencontainers.image.base.name="gcr.io/distroless/cc-debian12:nonroot"
 LABEL org.opencontainers.image.created="$CREATED"
-LABEL org.opencontainers.image.description="Single Sign-On Identity & Access Management via OpenID Connect, OAuth 2, and PAM"
-LABEL org.opencontainers.image.documentation="https://sebadob.github.io/rauthy/"
-LABEL org.opencontainers.image.licenses="Apache-2.0"
-LABEL org.opencontainers.image.source="https://github.com/sebadob/rauthy"
-LABEL org.opencontainers.image.title="Rauthy"
-LABEL org.opencontainers.image.url="https://github.com/sebadob/rauthy"
-LABEL org.opencontainers.image.vendor="Sebastian Dobe"
+LABEL org.opencontainers.image.description="Downstream patched build of Rauthy: Single Sign-On Identity & Access Management via OpenID Connect, OAuth 2, and PAM. Not an upstream release and not endorsed by the upstream project."
+LABEL org.opencontainers.image.title="Rauthy (patched)"
 LABEL org.opencontainers.image.version="$VERSION"
+LABEL org.opencontainers.image.revision="$REVISION"
+# `source` and `url` name where THESE bytes come from, which is the downstream fork, not upstream.
+LABEL org.opencontainers.image.source="https://github.com/bartekus/rauthy"
+LABEL org.opencontainers.image.url="https://github.com/bartekus/rauthy"
+LABEL org.opencontainers.image.vendor="bartekus (downstream distributor)"
+# The upstream release these bytes are built from, so a consumer can diff them against it.
+LABEL org.rauthy.patched.upstream.base="$UPSTREAM_BASE"
+LABEL org.rauthy.patched.upstream.commit="$UPSTREAM_COMMIT"
+LABEL org.rauthy.patched.upstream.repository="https://github.com/sebadob/rauthy"
 
 USER $TARGET_USER
 

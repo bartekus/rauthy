@@ -214,7 +214,7 @@ not a rebuild of it.
 | Device grant (RFC 8628), including its negative cases | `handler_auth::test_device_code_flow` | **new in this release**, both backends |
 | Audience and scope enforcement, negative cases | `zzf_handler_resource_indicators`, `zzg_handler_token_exchange`, `handler_scopes` | both backends |
 | Fresh backups, rapid repeated requests | `handler_generic::test_backup_download_is_complete` | F1 end to end: the declared `Content-Length`, the received length, and the listing's size must all agree |
-| Backup read failure reaches the client | `api::backup::tests` | F1 directly |
+| Backup read failure reaches the client | `api::backup::tests` | F1 directly, plus the declared length as a bound in both directions |
 | Restore into fresh storage, identity and key continuity | acceptance G | restore correctness |
 | Invalid / truncated / missing restore input | acceptance G | refusal without destroying the last recoverable state |
 | Observable unavailability after storage failure | acceptance K | F3, with real failure injection |
@@ -363,7 +363,15 @@ noted that the new S3 error branch put a raw object-store error into the respons
 the conversion this ledger vetted for credential safety; the cause now goes to the log and the
 client gets a message without it.
 
-The pattern across both rounds is worth naming: each time, the review found a place where this
+Round five returned a clean verdict and one narrow observation it explicitly did not call a
+defect: `get_backup_local` read the file's length once and committed to it as `Content-Length`, so
+a file that grew mid-download would have framed the response wrongly. Nothing appends to a
+finished backup and the route lists only completed files, so it was not reachable. It was closed
+anyway, because it is two lines and the function's whole purpose is to make the response's framing
+trustworthy: `pump_reader` now treats the declared length as a bound in both directions, sending
+no more than it and failing the stream rather than ending short of it.
+
+The pattern across the rounds is worth naming: each time, the review found a place where this
 ledger claimed more completeness than the code had. That is the failure mode a release document
 invites, and it is why the review reads the ledger as well as the diff.
 

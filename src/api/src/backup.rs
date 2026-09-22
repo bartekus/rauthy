@@ -139,7 +139,7 @@ pub async fn get_backup_local(
 
     let (tx, rx) = futures::channel::mpsc::channel(1);
 
-    task::spawn(pump_reader(rdr, tx, filename.clone()));
+    task::spawn(pump_reader(rdr, tx, filename.clone(), len));
 
     // `SizedStream` rather than `streaming`, so the response carries a `Content-Length`. It makes
     // a short body detectable by any HTTP client on its own terms, without depending on the
@@ -230,14 +230,35 @@ pub async fn get_backup_s3(
 /// consumer that only checks the status and a non-empty body (which is what rauthy's own backup
 /// consumers do) accepted a truncated SQLite snapshot as a good backup. Sending `Err` makes actix
 /// abort the body instead, so the client's read fails.
-async fn pump_reader<R>(mut rdr: R, mut tx: Sender<BackupChunk>, name: String)
+async fn pump_reader<R>(mut rdr: R, mut tx: Sender<BackupChunk>, name: String, expected: u64)
 where
     R: AsyncRead + Unpin,
 {
     let mut buf = [0u8; 8 * 1024];
+    let mut sent: u64 = 0;
     loop {
-        match rdr.read(&mut buf).await {
-            Ok(0) => break,
+        // Never exceed the declared length. The size was read from the file's metadata before
+        // the first byte went out, and the two are what the response frames itself with: a body
+        // longer than its `Content-Length` desynchronises a keep-alive connection. Nothing is
+        // expected to append to a finished backup, so this is a bound, not a behaviour.
+        let room = match expected.checked_sub(sent) {
+            Some(0) | None => break,
+            Some(room) => room.min(buf.len() as u64) as usize,
+        };
+
+        match rdr.read(&mut buf[..room]).await {
+            Ok(0) => {
+                // EOF before the declared length: the file shrank or was truncated under us.
+                // Ending here would hand the client a short body under a `Content-Length` that
+                // says otherwise, which is the failure this whole function exists to prevent.
+                error!("Local backup {name} ended after {sent} of {expected} bytes");
+                let _ = tx
+                    .send(Err(format!(
+                        "Backup {name} ended after {sent} of {expected} bytes"
+                    )))
+                    .await;
+                break;
+            }
             Ok(len) => {
                 if tx
                     .send(Ok(Bytes::copy_from_slice(&buf[..len])))
@@ -247,6 +268,7 @@ where
                     // The client hung up. It already knows it did not get the whole file.
                     break;
                 }
+                sent += len as u64;
             }
             Err(err) => {
                 error!(?err, "Error reading local backup {name}");
@@ -296,10 +318,12 @@ mod tests {
     async fn a_complete_read_streams_every_byte_and_no_error() {
         let (tx, rx) = futures::channel::mpsc::channel(1);
         let body = vec![7u8; 20 * 1024];
+        let len = body.len() as u64;
         tokio::spawn(pump_reader(
             io::Cursor::new(body.clone()),
             tx,
             "good.sqlite".to_string(),
+            len,
         ));
 
         let chunks = drain(rx).await;
@@ -314,6 +338,49 @@ mod tests {
         assert_eq!(streamed, body);
     }
 
+    /// A body must never exceed the length the response declared, whatever the reader offers.
+    #[tokio::test]
+    async fn the_body_never_exceeds_the_declared_length() {
+        let (tx, rx) = futures::channel::mpsc::channel(1);
+        // The reader has more than the declared length: only the declared length may go out.
+        tokio::spawn(pump_reader(
+            io::Cursor::new(vec![3u8; 20 * 1024]),
+            tx,
+            "grew.sqlite".to_string(),
+            12 * 1024,
+        ));
+
+        let chunks = drain(rx).await;
+        assert!(chunks.iter().all(|c| c.is_ok()), "no error is warranted");
+        let streamed: usize = chunks.into_iter().map(|c| c.unwrap().len()).sum();
+        assert_eq!(streamed, 12 * 1024);
+    }
+
+    /// And it must never fall short of it silently either.
+    #[tokio::test]
+    async fn a_body_shorter_than_declared_ends_in_an_error() {
+        let (tx, rx) = futures::channel::mpsc::channel(1);
+        tokio::spawn(pump_reader(
+            io::Cursor::new(vec![4u8; 4 * 1024]),
+            tx,
+            "shrank.sqlite".to_string(),
+            32 * 1024,
+        ));
+
+        let chunks = drain(rx).await;
+        let err = chunks
+            .last()
+            .expect("some bytes went out first")
+            .as_ref()
+            .expect_err(
+                "a short file must not end the body cleanly under a longer declared length",
+            );
+        assert!(
+            err.contains("4096 of 32768"),
+            "the shortfall must be stated: {err}"
+        );
+    }
+
     /// The regression this guards: a mid-stream read error used to end the body cleanly, so the
     /// client saw a 200 with a short file and no way to tell it was short.
     #[tokio::test]
@@ -325,6 +392,7 @@ mod tests {
             },
             tx,
             "truncated.sqlite".to_string(),
+            64 * 1024,
         ));
 
         let chunks = drain(rx).await;

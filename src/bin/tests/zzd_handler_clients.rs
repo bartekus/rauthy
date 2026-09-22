@@ -15,6 +15,12 @@ use std::error::Error;
 
 mod common;
 
+/// `test_clients` asserts that it removed no client it did not create, by comparing the full
+/// client list before and after. The other tests in this file create and delete clients of their
+/// own, so run concurrently they make that comparison fail on state the test did not touch. The
+/// tests run one at a time; each still asserts only about what it owns.
+static CLIENT_LIST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn extract_raw_claims(token: &str) -> Vec<u8> {
     let mut split = token.split('.');
     split.next().unwrap();
@@ -103,6 +109,7 @@ async fn put_client_claims(
 
 #[tokio::test]
 async fn test_clients() -> Result<(), Box<dyn Error>> {
+    let _serial = CLIENT_LIST.lock().await;
     let auth_headers = get_auth_headers().await?;
     let backend_url = get_backend_url();
 
@@ -320,6 +327,7 @@ async fn test_clients() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn test_client_favicon_is_independent_from_logo() -> Result<(), Box<dyn Error>> {
+    let _serial = CLIENT_LIST.lock().await;
     const LOGO: &[u8] = include_bytes!("../../../assets/logo/rauthy_dark_small.png");
     const FAVICON: &[u8] = include_bytes!("../../../assets/logo/rauthy_light_small.png");
     const FAVICON_SVG: &[u8] = include_bytes!("../../../assets/logo/rauthy_light.svg");
@@ -487,6 +495,7 @@ async fn test_client_favicon_is_independent_from_logo() -> Result<(), Box<dyn Er
 
 #[tokio::test]
 async fn test_client_secret() -> Result<(), Box<dyn Error>> {
+    let _serial = CLIENT_LIST.lock().await;
     let auth_headers = get_auth_headers().await?;
     let backend_url = get_backend_url();
     let client = reqwest::Client::new();
@@ -591,6 +600,7 @@ async fn test_client_secret() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn test_client_credentials_custom_claims() -> Result<(), Box<dyn Error>> {
+    let _serial = CLIENT_LIST.lock().await;
     let auth_headers = get_auth_headers().await?;
     let backend_url = get_backend_url();
     let client = reqwest::Client::new();

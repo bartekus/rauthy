@@ -80,7 +80,16 @@ where
                 }
             }
 
-            if let Some(blacklisted) = IpBlacklist::get(ip.to_string()).await? {
+            let blacklisted = match IpBlacklist::get(ip.to_string()).await {
+                Ok(b) => b,
+                // The lookup is a cache read, so on a node whose storage is out of service it
+                // fails for every request. The probes must still reach their own handlers, which
+                // answer `503` for exactly that state; an error here would turn them into a `500`
+                // that says nothing about readiness. Nothing else is let through.
+                Err(_) if is_probe(req.path()) => None,
+                Err(err) => return Err(err.into()),
+            };
+            if let Some(blacklisted) = blacklisted {
                 debug_assert_eq!(blacklisted.ip, ip.to_string());
                 debug_assert!(blacklisted.exp >= Utc::now());
 
@@ -94,6 +103,11 @@ where
             service.call(req).await
         })
     }
+}
+
+#[inline]
+fn is_probe(path: &str) -> bool {
+    matches!(path, "/auth/v1/ready" | "/auth/v1/health" | "/auth/v1/ping")
 }
 
 #[inline]

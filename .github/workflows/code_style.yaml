@@ -8,6 +8,12 @@ on:
       - synchronize
       - ready_for_review
 
+# Downstream addition. Without a block the token takes the repository default, which on this fork
+# is `write`, so a pull request from a branch here would lint its code holding a token that can
+# push. The job only reads the tree.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

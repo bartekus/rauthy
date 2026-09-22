@@ -142,7 +142,7 @@ Reported to the Hiqlite release owner with evidence; repaired in `bartekus/hiqli
 
 | Package | Selected | Source in the current candidate |
 |---|---|---|
-| `hiqlite-patched` | `=0.15.0-patched.1` via `hiqlite = { package = "hiqlite-patched", ... }` | git `bartekus/hiqlite` @ `34641b0a4b1d64ff1df24a6bd931c1dc4ff62b61` |
+| `hiqlite-patched` | `=0.15.0-patched.1` via `hiqlite = { package = "hiqlite-patched", ... }` | git `bartekus/hiqlite` @ `e1e9135587015310be5b8f259e5b86368f131ae8` |
 | `hiqlite-wal-patched` | pulled in by the above | same |
 | `hiqlite-derive-patched` | pulled in by the above | same |
 | `openraft` | `0.9.25` | crates.io, `a97014fb78acb77be3a40ac2da305f6dd3a6b243f3a908ace87d29b3972eaafd` |
@@ -255,6 +255,7 @@ and cannot qualify publication.
 | Hiqlite `d45826cd` | CI run `35767263504`, amd64 and arm64 | 101 passed, 3 failed (J, same cause); integration suites failed on F14 on both backends |
 | Hiqlite `d45826cd` + F12 | local, macOS arm64 | 98 passed, 0 failed, 2 skipped (J needs the Linux upstream binary) |
 | Hiqlite `34641b0a` | CI run `35771464936`, amd64 and arm64 | 113 passed, 1 failed (the refused upgrade's byte-level database check, which found the checkpoint described in section 5), 0 skipped; integration suites green on both backends |
+| Hiqlite `e1e91355` (tip `f5323a2c`) | CI run `35775723599`, every job | acceptance **117 passed, 0 failed, 0 skipped, strict** on amd64 and on arm64; integration suites green on both backends; Rahi's whole live suite 606 passed, 0 failed, 1 ignored by Rahi itself, no skips, passkey-only backup administrator proof passing. The last scratch run: the graph is git-sourced, so it cannot qualify publication |
 | Hiqlite `c7d0d6a9` | CI run `35764291279`, consumer job | Rahi's whole live suite: 606 passed, 0 failed, 1 ignored by Rahi itself, no skips; the passkey-only backup administrator proof ran and passed |
 
 The qualifying run is the one section 7 names, on the merge commit, against the published graph.
@@ -274,7 +275,7 @@ The qualifying run is the one section 7 names, on the merge commit, against the 
 
 > `hiqlite-patched`, `hiqlite-wal-patched` and `hiqlite-derive-patched` `0.15.0-patched.1` are not
 > on crates.io (checked against the crates.io API), and `bartekus/hiqlite` has no release tag for
-> them. Their tree is `release/downstream-packaging` @ `34641b0a`, with its PRs #25 to #30 open.
+> them. Their tree is `release/downstream-packaging` @ `e1e91355`, with its PRs #25 to #30 open.
 
 When they are published, the change here is one line in `Cargo.toml` (git source to
 `version = "=0.15.0-patched.1"`) and the lock, then:

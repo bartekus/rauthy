@@ -136,8 +136,11 @@ jobs:
                     "this run as an artifact._")
           PY
           cat review.md >> "$GITHUB_STEP_SUMMARY"
+          # `gh pr comment` posts an issue comment, which needs `issues: write`; this job
+          # deliberately does not have it. A comment-type review goes through the pulls API and
+          # needs only the `pull-requests: write` this job already holds.
           if [ -n "$PR_NUMBER" ]; then
-            gh pr comment "$PR_NUMBER" --body-file review.md
+            gh pr review "$PR_NUMBER" --comment --body-file review.md
           fi
 
       - uses: actions/upload-artifact@v4

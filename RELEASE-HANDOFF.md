@@ -180,6 +180,12 @@ code. The flow itself needed no fix.
 - Qualified at N = 1 only.
 - A terminal Hiqlite storage failure is observable only through the health watcher's periodic
   sample, so `/ready` turns over within roughly one to two minutes rather than immediately.
+- `panic = "abort"` is workspace-wide, so a panic anywhere aborts without running the storage
+  shutdown, and the next start then rebuilds the state machine. This release closed that class in
+  the startup path and the long-running background tasks, which is where all of it was found, and
+  proves each one with a test. It did not audit the per-request surface in `src/api`,
+  `src/service` and `src/data`. That exposure is identical in upstream `v0.36.2` and is neither
+  introduced nor worsened here, but it is not closed either.
 - Config errors abort the process rather than exiting cleanly. That is upstream's established
   mechanism throughout the config layer; the messages are actionable, but a supervisor sees an
   abort, not a clean non-zero exit. Changing it is a repo-wide refactor this release did not take

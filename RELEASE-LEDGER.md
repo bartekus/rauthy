@@ -96,10 +96,20 @@ key that exist but are not usable.
 | `Shutdown complete` during that start | **0** | 3 |
 | Last line of output | a panic backtrace note | `The TLS key <path> is not a usable PEM private key: no items found` |
 
-### The rest of the class, swept
+### The rest of the class, in the startup and scheduler paths
 
-After two review rounds each found one more post-`DB::init()` panic, the remaining sites were
-enumerated rather than left to a third round.
+After two review rounds each found one more post-`DB::init()` panic, the remaining sites in the
+paths those two findings came from were enumerated rather than left to a third round.
+
+The scope of that enumeration matters, and the fourth review round was right to push on how it
+was first worded here. `panic = "abort"` is a workspace-wide profile setting, so *any* panic
+anywhere aborts without running the shutdown, including one inside a request handler on a live
+node. What follows covers the startup path and the long-running background tasks, which is where
+F2, F7 and F8 lived. It does not cover the per-request surface in `src/api`, `src/service` and
+`src/data`. That surface carries the same exposure in upstream `v0.36.2`, unchanged by this
+release, and a spot check of it during review found the `unwrap`s guarded; auditing it in full is
+a larger piece of work than this release, and it is listed as an unresolved limitation rather than
+quietly implied to be done.
 
 - `server.rs` and `tls.rs` have none left.
 - `init_static_vars.rs`, `logging.rs` and `main.rs` panic in several places, and all of them run

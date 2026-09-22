@@ -14,8 +14,16 @@ use std::error::Error;
 
 mod common;
 
+/// Every test in this file logs in as the one shared `USERNAME`, and a login saves the whole user
+/// row it read. Run concurrently, a login that read the user before `test_user_picture` set its
+/// `picture_id` saves it back without one, and the picture test then fails on state it did not
+/// cause. That lost update is upstream's, in the login paths, and is recorded in the release
+/// ledger; this lock only stops the tests from racing each other through it.
+static SHARED_USER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn test_users() -> Result<(), Box<dyn Error>> {
+    let _serial = SHARED_USER.lock().await;
     let auth_headers = get_auth_headers().await?;
 
     // get all users and check the admin user
@@ -135,6 +143,7 @@ async fn test_users() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn test_password_reset_always_ok() -> Result<(), Box<dyn Error>> {
+    let _serial = SHARED_USER.lock().await;
     let auth_headers = get_auth_headers().await?;
     let client = reqwest::Client::new();
 
@@ -169,6 +178,7 @@ async fn test_password_reset_always_ok() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn test_userinfo() -> Result<(), Box<dyn Error>> {
+    let _serial = SHARED_USER.lock().await;
     let url = format!("{}/oidc/userinfo", get_backend_url());
     let client = reqwest::Client::new();
 
@@ -194,6 +204,7 @@ async fn test_userinfo() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn test_user_picture() -> Result<(), Box<dyn Error>> {
+    let _serial = SHARED_USER.lock().await;
     let auth_headers = get_auth_headers().await?;
     let client = reqwest::Client::new();
 

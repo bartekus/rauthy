@@ -27,6 +27,13 @@ CONFIG_TEMPLATE="$HERE/acceptance-config.toml"
 WORK="${ACCEPTANCE_WORK:-$(mktemp -d)}"
 ADMIN_EMAIL="admin@localhost"
 ADMIN_PASSWORD="Acceptance123SuperSafe!"
+# An API key bootstrapped alongside the admin, so that a scenario can read the identity data back
+# out of a running instance without driving a browser login. `BOOTSTRAP_API_KEY` is base64 of an
+# `ApiKeyRequest`; the secret has to be exactly `API_KEY_LENGTH` characters.
+API_KEY_NAME="acceptance"
+API_KEY_SECRET="AcceptanceApiKeySecret0123456789AcceptanceApiKeySecret0123456789"
+API_KEY_JSON='{"name":"acceptance","exp":null,"access":[{"group":"Users","access_rights":["read"]}]}'
+API_KEY_B64="$(printf '%s' "$API_KEY_JSON" | base64 | tr -d '\n')"
 
 PASS=0
 FAIL=0
@@ -68,6 +75,8 @@ start_node() {
       RP_ORIGIN="http://localhost:$http" \
       BOOTSTRAP_ADMIN_EMAIL="$ADMIN_EMAIL" \
       BOOTSTRAP_ADMIN_PASSWORD_PLAIN="$ADMIN_PASSWORD" \
+      BOOTSTRAP_API_KEY="$API_KEY_B64" \
+      BOOTSTRAP_API_KEY_SECRET="$API_KEY_SECRET" \
       "${BIN:-$RAUTHY}" serve -c config.toml >> "$dir/rauthy.log" 2>&1 &
     node=$!
     echo "$node" > "$dir/pid"
@@ -142,6 +151,14 @@ unclean_markers() {
 # Every `kid` the instance publishes, sorted. The whole set matters, not one of them: rauthy
 # serves a key per algorithm and the JWKS order is not stable, so comparing a single entry would
 # compare different keys on either side.
+# The admin's email as the instance itself reports it, through an authenticated API call. Empty
+# when the call fails, so a caller can tell "not there" from "there".
+admin_identity() {
+  curl -s -H "Authorization: API-Key ${API_KEY_NAME}\$${API_KEY_SECRET}" \
+    "http://127.0.0.1:$1/auth/v1/users" \
+    | grep -o "\"email\":\"$ADMIN_EMAIL\"" | head -1
+}
+
 sha256_of() {
   if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1
   else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -188,6 +205,10 @@ assert "the startup log names the upstream base it was built from" $?
 KID_FIRST="$(jwks_kid 8091)"
 [ -n "$KID_FIRST" ]
 assert "the instance publishes a signing key" $? "empty JWKS"
+
+[ -n "$(admin_identity 8091)" ]
+assert "the bootstrapped identity authenticates and is readable" $? \
+  "no $ADMIN_EMAIL behind the API key"
 
 # --- C: bad configuration ----------------------------------------------------
 
@@ -345,6 +366,11 @@ if [ -n "$BACKUP_FILE" ]; then
     "before: $KID_E after: $(jwks_kid 8096)"
   curl -s "http://127.0.0.1:8096/auth/v1/health" | grep -q '"db_healthy":true'
   assert "the restored instance is healthy" $?
+  # The identity itself, not just the keys: the original admin has to be there, and the credential
+  # that was bootstrapped with it has to still authenticate against the restored data.
+  [ -n "$(admin_identity 8096)" ]
+  assert "the original identity authenticates against the restored data" $? \
+    "no $ADMIN_EMAIL behind the API key after the restore"
   stop_node "$G"
 
   # Corrupt restore input must be refused, and must not destroy what is on disk.
@@ -388,6 +414,9 @@ else
   assert "the upgrade keeps the signing key" $? "before: $KID_UP after: $(jwks_kid 8099)"
   [ "$(unclean_markers "$J")" = "0" ]
   assert "the upgrade did not have to rebuild the state machine" $?
+  [ -n "$(admin_identity 8099)" ]
+  assert "the upgraded instance keeps the original identity" $? \
+    "no $ADMIN_EMAIL after the upgrade"
   stop_node "$J"
   sleep 3
 
@@ -399,6 +428,44 @@ else
     "rollback is blocked: $(tail -5 "$J/rauthy.log")"
   stop_node "$J"
 fi
+
+# --- L: the metrics listener is an exit path too ------------------------------
+
+log "L. A metrics listener that cannot start fails cleanly"
+L="$WORK/l-metrics"; mkdir -p "$L"
+# Occupy the metrics port before the node is asked to bind it.
+python3 -c "
+import socket, time, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', 9090)); s.listen(1)
+sys.stderr.write('bound\n'); sys.stderr.flush()
+time.sleep(600)
+" 2> "$L/squatter.log" &
+SQUATTER=$!
+sleep 2
+
+run_until_exit "$L" 8089 8119 8219 240 METRICS_ENABLE=true METRICS_ADDR=127.0.0.1 METRICS_PORT=9090
+RC=$?
+[ "$RC" -ne 0 ]
+assert "a metrics listener that cannot bind fails the start" $? "exit code was $RC"
+grep -qi 'metrics listener' "$L/rauthy.log"
+assert "the failure names the metrics listener" $? "$(tail -3 "$L/rauthy.log")"
+
+kill "$SQUATTER" 2>/dev/null; wait "$SQUATTER" 2>/dev/null
+sleep 1
+
+# The point of the leg: this exit path must also have gone through the storage shutdown, or the
+# next start inherits an ungraceful one.
+mv "$L/rauthy.log" "$L/metrics-failure.log"
+start_node "$L" 8089 8119 8219 METRICS_ENABLE=true METRICS_ADDR=127.0.0.1 METRICS_PORT=9090
+wait_ready "$L" 8089 300
+assert "the node starts once the metrics port is free" $? "see $L/rauthy.log"
+[ "$(unclean_markers "$L")" = "0" ]
+assert "the metrics failure shut the storage layer down cleanly" $? \
+  "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$L/rauthy.log" | head -3)"
+curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:9090/metrics" | grep -q 200
+assert "metrics are served once the port is free" $?
+stop_node "$L"
 
 # --- K: observable unavailability after a storage failure --------------------
 

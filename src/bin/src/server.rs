@@ -247,6 +247,12 @@ async fn server_with_metrics() -> std::io::Result<()> {
     let listen_scheme = RauthyConfig::get().listen_scheme.clone();
     let listen_addr = RauthyConfig::get().vars.server.listen_address.to_string();
 
+    // Everything in here runs after `DB::init()`, so a panic is a data-directory hazard rather
+    // than a crash: this workspace builds with `panic = "abort"`, which runs no cleanup from any
+    // thread, so the storage layer would never reach its shutdown and the next start would treat
+    // the directory as an ungraceful exit. The configuration is therefore validated and the
+    // metrics port is bound here, where a failure is an error that `run()` can act on, and only
+    // an already-bound listener is handed to the thread.
     let shared_registry = Registry::new();
     let metrics = PrometheusMetricsBuilder::new("api")
         .registry(shared_registry.clone())
@@ -254,28 +260,41 @@ async fn server_with_metrics() -> std::io::Result<()> {
         .exclude("/favicon.ico")
         .exclude("/metrics")
         .build()
-        .unwrap();
+        .map_err(|err| {
+            std::io::Error::other(format!("Cannot build the metrics endpoint: {err}"))
+        })?;
+
+    let vars = &RauthyConfig::get().vars.server;
+    Ipv4Addr::from_str(&vars.metrics_addr).map_err(|err| {
+        std::io::Error::other(format!(
+            "Cannot parse `metrics_addr` '{}': {err}",
+            vars.metrics_addr
+        ))
+    })?;
+    let addr_full = format!("{}:{}", vars.metrics_addr, vars.metrics_port);
+    let metrics_listener = std::net::TcpListener::bind(&addr_full).map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!("Cannot bind the metrics listener to {addr_full}: {err}"),
+        )
+    })?;
 
     thread::spawn(move || {
-        let vars = &RauthyConfig::get().vars.server;
-        if let Err(err) = Ipv4Addr::from_str(&vars.metrics_addr) {
-            let msg = format!("Error parsing METRICS_ADDR: {err}");
-            error!(msg);
-            panic!("{}", msg);
-        }
-        let addr_full = format!("{}:{}", vars.metrics_addr, vars.metrics_port);
-
         info!("Metrics available on: http://{addr_full}/metrics");
         // TODO create single threaded runtime specifically -> probably use tokio
-        System::new()
-            .block_on(
-                HttpServer::new(move || App::new().wrap(metrics.clone()))
-                    .workers(1)
-                    .bind(addr_full)
-                    .unwrap()
-                    .run(),
-            )
-            .unwrap();
+        let res = System::new().block_on(async move {
+            HttpServer::new(move || App::new().wrap(metrics.clone()))
+                .workers(1)
+                .listen(metrics_listener)?
+                .run()
+                .await
+        });
+        // Metrics are opt-in and auxiliary. Losing them is worth reporting loudly; it is not
+        // worth aborting an identity provider, least of all in a way that skips the storage
+        // shutdown and costs the next start its state machine.
+        if let Err(err) = res {
+            error!("The metrics server stopped: {err}. Metrics are no longer being served.");
+        }
     });
 
     let metrics_collector = PrometheusMetricsBuilder::new("rauthy")
@@ -284,7 +303,9 @@ async fn server_with_metrics() -> std::io::Result<()> {
         .exclude("/favicon.ico")
         .exclude("/metrics")
         .build()
-        .unwrap();
+        .map_err(|err| {
+            std::io::Error::other(format!("Cannot build the metrics collector: {err}"))
+        })?;
 
     let server = HttpServer::new(move || {
         let mut app = App::new()

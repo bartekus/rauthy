@@ -59,11 +59,29 @@ each has a test that fails without it. Nothing else from the fork's other branch
 | F3 | `GET /auth/v1/ready` answered `200` unconditionally. | It is the documented readiness probe for Kubernetes and Docker. An orchestrator kept routing to a node whose storage was unreachable. It now answers `503` on the health watcher's confirmed verdict, debounced through the watcher's existing re-check so a leader change does not flap a node out of service. |
 | F4 | A config file that could not be read was replaced by an empty config with only a `warn!`. | A mistyped `--config-file` surfaced as "Missing `encryption.keys`", which sends an operator to the wrong place. Configuring entirely through environment variables stays supported: an absent file at the *default* path is still only a warning. A path the operator named, or a file that exists and cannot be read, is now a startup failure that names itself. |
 | F5 | `zzd_handler_clients::test_clients` compared a global client count across its body while its neighbours in the same test binary created and deleted clients concurrently. | A test defect, repaired rather than tolerated: it made the suite fail on an unrelated schedule. It now asserts about the clients it owns. |
+| F7 | `server_with_metrics()` still panicked in five places reached after `DB::init()`: two metrics-builder `unwrap`s, a `panic!` on a malformed `metrics_addr`, the metrics listener's `bind().unwrap()`, and the `block_on().unwrap()` around its run loop. | Found by the independent review, which correctly read this as a counterexample to F2's own claim of completeness rather than a separate issue. Under `panic = "abort"` these abort the process from any thread with no cleanup, so with `metrics_enable = true` a taken metrics port cost the next start its state machine, exactly the failure F2 exists to close. The configuration is now validated and the metrics port bound in the async function, where a failure is an error `run()` can act on, and only an already-bound listener is handed to the thread. The run loop's own failure is logged rather than fatal: metrics are opt-in and auxiliary, and losing them does not justify aborting an identity provider, least of all in the one way that skips the storage shutdown. |
 | F6 | The device grant (RFC 8628) had no test. The well-known document advertised the endpoint and nothing exercised it. | A coverage gap, not a code defect: the consumer drives this flow for its native clients, so the release could not claim it without a test. `test_device_code_flow` now covers the grant request, a poll before approval (`authorization_pending`), an unknown device code, the approval through an authenticated session, and the token set. No product change was needed; the flow works. |
 
 Downstream identity, not a defect fix: the version marker, the startup log line naming distributor
 and upstream base, the `patched.N` marker being recognised instead of warned about as an upstream
 pre-release, and the image labels.
+
+### F2, measured against the upstream binary
+
+The same scenario, run twice in the same container image, once with upstream's own `v0.36.2`
+binary taken out of `ghcr.io/sebadob/rauthy:0.36.2` and once with this release's `linux/arm64`
+artefact. The port is occupied first, so the listener cannot bind; the node is then started again
+normally on the same data directory.
+
+| | upstream `v0.36.2` | `0.36.2-patched.1` |
+|---|---|---|
+| Exit code of the failed start | 1 | 1 |
+| `Shutdown complete` during that start | **0** | 3 |
+| Unclean-shutdown markers on the next start | **3** | 0 |
+
+Upstream's third marker is `Node did not shut down gracefully - auto-rebuilding State Machine`: a
+failed bind costs it the state machine, which is then rebuilt from the raft log. This is the
+defect, not an inference about it.
 
 ### Contracts traced that needed no change
 
@@ -126,6 +144,11 @@ N = 1 only, and single-node results say nothing about N = 3.
 `assets/release/acceptance.sh` runs the process-level legs against the release binary; the cargo
 suites run against a live backend on both database backends. Every repair maps to a test.
 
+Result on the candidate's own artefacts: **41 passed, 0 failed, 0 skipped** on `linux/amd64` and
+the same on `linux/arm64`, each on its own native runner, plus both integration suites and the
+style checks. The upgrade and rollback legs run against the real upstream `v0.36.2` binary taken
+out of `ghcr.io/sebadob/rauthy:0.36.2`, not a rebuild of it.
+
 | Requirement | Test | Covers |
 |---|---|---|
 | First boot, valid config | acceptance A, B | identity, readiness, health, JWKS |
@@ -144,6 +167,8 @@ suites run against a live backend on both database backends. Every repair maps t
 | Observable unavailability after storage failure | acceptance K | F3, with real failure injection |
 | Upgrade from the upstream baseline | acceptance J | in-place upgrade and rollback |
 | Release identity and version parsing | acceptance A, `db_version::tests` | `--version`, marker handling, rollback safety |
+| Identity survives restore and upgrade | acceptance B, G, J | the bootstrapped credential authenticates and the original admin is readable, on a first boot, after a restore, and after an upgrade |
+| A metrics listener that cannot start | acceptance L | F7: the failure is an error, not an abort, and the data directory stays clean |
 
 ### Legs not covered, and why
 
@@ -156,6 +181,14 @@ suites run against a live backend on both database backends. Every repair maps t
   real storage failure on the Postgres backend, where stopping the database is deterministic. The
   Hiqlite backend has no equivalent external injection point; that leg lands in Hiqlite's own
   repaired append-completion path, which is the other session's scope.
+- **A backup download cancelled by the client.** The consumer takes its backups under a deadline
+  and can abandon a download. The code path is there and is the one silent exit `pump_reader`
+  keeps: a send into a closed channel ends the pump, because the client already knows it did not
+  get the file. It is not separately asserted, because provoking a mid-download hang-up through
+  the real handler needs a client that can be made to stop reading at a chosen byte, which this
+  suite has no way to build. The suppression window and the snapshot naming that the consumer's
+  deadline logic actually reads are hiqlite's, not rauthy's; section 7 lists them as things to
+  re-check when the packages are swapped.
 - **N = 3.** Not attempted. Not claimed.
 - **Bit-for-bit reproducibility.** Not claimed and not verified. `src/common/build.rs` stamps
   `BUILD_TIME` from the wall clock, so two builds of the same tree differ by construction.
@@ -198,9 +231,17 @@ mechanism; it does not qualify a release.
 After the real swap:
 
 1. `cargo tree -i hiqlite-patched` and `cargo metadata` must again show the patched packages
-   selected for every storage path, with no second upstream copy in the graph.
+   selected for every storage path, with no second upstream copy in the graph. The publish
+   workflow enforces this on its own: it refuses to run if any package matching `hiqlite*`
+   resolves to anything but a registry, or if `Cargo.toml` still carries an active
+   `[patch.crates-io]` entry for one. That guard was exercised against the path-based experiment
+   above, which it correctly refuses.
 2. Re-run the full candidate workflow. The dependency changed, so every earlier result is void.
-3. Publish from the run that tested the new graph.
+3. Re-check the two hiqlite contracts the consumer's backup verb reads rather than calls: the
+   snapshot file name (`backup_node_<id>_<seconds>.sqlite`, whose timestamp the consumer parses)
+   and the window during which a fresh backup request is suppressed. Neither is a rauthy API, so
+   nothing in rauthy's own suite would notice them changing.
+4. Publish from the run that tested the new graph.
 
 Note for whoever does the swap: `.cargo/config.toml` sets `global-min-publish-age = '10 days'`
 under `[unstable]`. It is only honoured by nightly cargo, and this release builds on stable
@@ -245,11 +286,39 @@ and upstream-base labels.
 release publishes binaries and an OCI image; it publishes no Rust package, so it needs no crates.io
 credential. A cargo token would not grant GHCR permission in any case.
 
-## 9. Upstream return path and maintenance
+## 9. Independent review
 
-F1 through F4 are defects in upstream `v0.36.2` and are candidates for upstream pull requests
+`release-review.yaml` reviewed the candidate against `v0.36.2`. Its verdict was that nothing found
+should block the release, with one concrete defect: the residual `panic = "abort"` exit paths in
+`server_with_metrics()` described as F7 above, which it correctly identified as contradicting F2's
+own claim rather than as a separate issue. The review also verified, by inspection rather than by
+taking this ledger's word for it, that `[patch.crates-io]` is commented out, that all three
+Hiqlite packages resolve to crates.io with the checksums section 4 lists, that no workflow
+references `CARGO_REGISTRY_TOKEN`, and that the review workflow's `pull_request` trigger is the
+safe one.
+
+F7 was fixed rather than added to the disclosed limitations, and acceptance leg L was added to
+hold it: the release now proves that exit path the same way it proves the listener one, instead of
+asserting it.
+
+Two earlier review attempts are part of the record because both failed in ways worth keeping:
+
+- The first refused to run at all (`Unsupported event type: push`), which is why the review lives
+  in its own `pull_request`-triggered workflow.
+- The second ran to completion and left nothing behind: no comment, no job summary, and an
+  execution log that stays on the runner. A review that evaporates is indistinguishable from an
+  approval, so the workflow now extracts the verdict from the execution log itself and publishes
+  it, rather than asking the reviewer to remember to.
+
+## 10. Upstream return path and maintenance
+
+F1 through F4 and F7 are defects in upstream `v0.36.2` and are candidates for upstream pull requests
 against upstream's development line, where the same code paths are unchanged. That is a separate
 piece of work in the upstream repository and nothing in this release touches it.
+
+`CHANGELOG.md` is deliberately untouched. It is upstream's record of upstream's releases, and
+editing it here would put downstream entries in the way of every future rebase onto a new upstream
+patch release. This ledger is this distribution's changelog.
 
 Downstream security maintenance: this line tracks upstream `v0.36.x`. An upstream patch release
 becomes `0.36.<z>-patched.1` on a new `release/` branch cut from that tag, with this ledger and the

@@ -5,8 +5,9 @@ For the session that adopts this build in `rahi`. The decisions and the evidence
 
 > **Publication is held.** The image and the GitHub release do not exist yet, because the patched
 > Hiqlite packages this release must resolve are not published. Section "What is still missing"
-> says exactly what unblocks it. Everything below except the digests is final; do not pin anything
-> from this file until the digest table is filled in from a real publish run.
+> says exactly what unblocks it. Everything below is final except the concrete artefact values,
+> which no one can write down before a publish run produces them: pin from the
+> `RELEASE-PROVENANCE.md` that run attaches, never from this file.
 
 ## What this is
 
@@ -26,26 +27,26 @@ upstream's licence and authorship unchanged.
 
 ## Artefacts
 
-Filled in by the publish run. Until then these rows are empty on purpose.
+These values do not exist until something is published, so they are not written down here by hand.
+The publish run generates `RELEASE-PROVENANCE.md` from what it actually published and attaches it
+to the GitHub release, carrying:
 
-| Artefact | Value |
-|---|---|
-| GitHub release | _pending_ |
-| Tag | `v0.36.2-patched.1` |
-| Source commit | _pending_ |
-| Image index digest (multi-arch) | _pending_ |
-| `linux/amd64` manifest digest | _pending_ |
-| `linux/arm64` manifest digest | _pending_ |
-| `rauthy_amd64` sha256 | _pending_ |
-| `rauthy_arm64` sha256 | _pending_ |
+- the tag, the source commit, and the upstream base;
+- the image index digest and every per-platform manifest digest;
+- the sha256 of each binary;
+- every resolved Hiqlite package with its version, registry source and checksum;
+- the toolchain, the publish run, and the candidate run whose bytes were promoted.
+
+Pin from that file, not from this one. The tag will be `v0.36.2-patched.1` and the image
+`ghcr.io/bartekus/rauthy-patched:0.36.2-patched.1`, pinned by the index digest recorded there.
 
 ## Hiqlite packages
 
-| Package | Version | Registry checksum |
-|---|---|---|
-| `hiqlite-patched` | _pending selection_ | _pending_ |
-| `hiqlite-wal-patched` | _pending selection_ | _pending_ |
-| `hiqlite-derive-patched` | _pending selection_ | _pending_ |
+The release will resolve `hiqlite-patched`, `hiqlite-wal-patched` and `hiqlite-derive-patched`
+from crates.io, at versions selected when they are published, with their checksums recorded in
+`RELEASE-PROVENANCE.md`. The publish workflow refuses to run at all if any package matching
+`hiqlite*` resolves to anything but a registry, so a path dependency, a git branch or an inherited
+`[patch.crates-io]` override cannot reach a release by accident.
 
 The candidate as it stands resolves upstream `hiqlite 0.14.0` from crates.io
 (`8711815c093414290a5fcbc0bf74e1e70e3d6ef37e21735000178d25cee6fcf0`) and its two siblings. That is
@@ -94,6 +95,13 @@ The build stamps `0.36.2-patched.1` into the `config` table's `db_version` row.
   early under a `200`. `rahi`'s `RauthyApi::fetch` checks only the status and a non-empty body, so
   before this fix a truncated snapshot would have been sealed into an archive. No `rahi` change is
   needed to benefit: the failed read surfaces through `reqwest` as a transport error.
+- **Two hiqlite contracts your backup verb depends on, unchanged here but worth naming.** `rahi`
+  parses the unix timestamp out of the snapshot file name (`backup_node_<id>_<seconds>.sqlite`) to
+  decide which snapshot its own trigger produced, and it models a suppression window during which
+  hiqlite ignores a fresh backup request. Both belong to hiqlite, not to rauthy, and neither is
+  touched by this release: snapshots still arrive as `backup_node_1_<seconds>.sqlite`. They are
+  exactly the kind of thing a Hiqlite package swap could change silently, so re-check them when
+  this release moves onto the patched packages.
 - **Restore.** Unchanged: hiqlite's `HQL_BACKUP_RESTORE` into a fresh data directory. The restored
   instance keeps the original signing keys, so tokens and sessions issued before the backup stay
   verifiable. A truncated or missing restore input is refused and the last recoverable state is
@@ -111,26 +119,36 @@ The build stamps `0.36.2-patched.1` into the `config` table's `db_version` row.
 
 ## Test results
 
+All of the following ran in CI against the candidate's own artefacts.
+
 | Leg | Result |
 |---|---|
+| Frontend check (`svelte-check`, warnings fatal) | pass |
+| Style and unit checks (`cargo fmt --check`, `cargo clippy --workspace -D warnings`) | pass |
 | Integration suite, Hiqlite backend | pass |
 | Integration suite, Postgres backend | pass |
-| Style and unit checks (`cargo fmt --check`, `cargo clippy --workspace -D warnings`) | pass |
-| Acceptance harness, 36 assertions | pass, 0 failed |
-| Upgrade and rollback against the real upstream `v0.36.2` binary | pending the CI run on Linux |
-| `linux/amd64` acceptance against the release binary | pending the CI run |
-| `linux/arm64` acceptance against the release binary | pending the CI run |
+| Release binary, `linux/amd64` and `linux/arm64` | built, checksummed |
+| Acceptance against the `linux/amd64` release binary | **41 passed, 0 failed, 0 skipped** |
+| Acceptance against the `linux/arm64` release binary | **41 passed, 0 failed, 0 skipped** |
+| Independent review | ran; one finding, fixed and covered by a new acceptance leg |
 
-The 36 passing acceptance assertions were produced on macOS/aarch64 against a debug build during
-development. **They do not certify the release artefact**: the qualifying run is the one in
-`release-candidate.yaml`, which runs the same harness against the actual Linux release binaries on
-both architectures, plus the upgrade and rollback legs that need the upstream binary.
+Both architectures get the same acceptance, on their own native runner, against the binary that
+ships. That includes the upgrade and rollback legs, which run against the real upstream `v0.36.2`
+binary taken out of `ghcr.io/sebadob/rauthy:0.36.2` rather than a rebuild of it, and the
+storage-failure leg, which takes a real database away from a running instance.
+
+Measured, not assumed: both binaries require at most `GLIBC_2.34`, and `debian:bookworm-slim`
+provides 2.36. The consumer's own pattern was exercised directly - the image built from these
+binaries, `/app/rauthy` copied out of it into `debian:bookworm-slim` exactly as `docker/Dockerfile`
+does, and the result runs and reports `rauthy 0.36.2-patched.1`. That was done in an isolated
+workspace; the `rahi` checkout was not touched, and it is not a statement about published `rahi`
+compatibility.
 
 Skipped and why: passkey-only backup administrator with MFA (a consumer-side configuration this
 release does not change; no rauthy change was made for it); terminal Hiqlite storage failure
 injected from outside the process (no external injection point - the Postgres equivalent is
-covered); N = 3 (not attempted, not claimed); bit-for-bit reproducibility (not claimed; `BUILD_TIME`
-is stamped from the wall clock).
+covered); N = 3 (not attempted, not claimed); bit-for-bit reproducibility (not claimed;
+`BUILD_TIME` is stamped from the wall clock).
 
 ## Fixes in this build
 
@@ -141,7 +159,9 @@ is stamped from the wall clock).
    cannot bind.
 3. `/auth/v1/ready` answers `503` when storage is confirmed unreachable.
 4. An unreadable config file fails the start and names itself.
-5. A shared-state defect in upstream's own client handler test.
+5. A metrics listener that cannot start is now an error rather than a process abort, so it does
+   not cost the next start its state machine either. Found by the independent review.
+6. A shared-state defect in upstream's own client handler test.
 
 And one coverage gap closed without a product change: the device grant (RFC 8628) had no test in
 rauthy's own suite, although `rahi` drives it for native clients. `test_device_code_flow` now
@@ -159,6 +179,17 @@ code. The flow itself needed no fix.
   on.
 
 ## What is still missing
+
+**Package visibility may need one owner action.** A GHCR package pushed by a workflow token is
+private by default, and a private package is not consumable however correct the release is. The
+publish run checks this the way an outside consumer would, with an anonymous pull token and no
+credentials, and says in its job summary whether the image is publicly pullable. If it is not, the
+remaining step is:
+
+> https://github.com/users/bartekus/packages/container/rauthy-patched/settings
+> -> Change package visibility -> Public
+
+No workflow token can do that. Until it is done, do not treat the image as consumable.
 
 **The patched Hiqlite packages.** `hiqlite-patched`, `hiqlite-wal-patched` and
 `hiqlite-derive-patched` do not exist on crates.io, and `bartekus/hiqlite` has no tags or releases.

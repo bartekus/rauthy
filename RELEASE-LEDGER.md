@@ -69,6 +69,9 @@ row says otherwise.
 | F13 | `hiqlite::Error::NodeFailed` carries an account naming internal components and file paths, and fell through to a catch-all that put it in the response body. The account now goes to the log; the client gets "The storage layer of this node is out of service". | Acceptance P, "the refusal does not expose the storage path to the client" (meaningful only on a Hiqlite tree that refuses reads, see 3.4) |
 | F15 | **New, found by review round 11.** Self-signed certificate generation (`SelfSignedCA`), which runs at startup and on every renewal of a serving node, after `DB::init()`, `unwrap()`ed eight results: the stored CA row's decoding, key generation and parsing, both signatures, and the certificate name taken from `PUB_URL`. A `PUB_URL` host that is not a valid DNS name (non-ASCII, for one) aborted the start. Each is now an error; at startup that fails the start through the storage shutdown, and in the renewal task it is logged and retried. | Measured: `PUB_URL=bücher.localhost:8448` with self-signed TLS exits 134 on the unfixed tree, and the next start reports 3 unclean-shutdown markers; exit 1 and a clean next start with the fix. Acceptance M3, observed failing (3 of 4 assertions) without the fix |
 | F16 | **New, found tracing the shutdown contract.** The mail sender connects to SMTP after `DB::init()`. An incomplete configuration (`SMTP_URL` without `SMTP_USERNAME` or `SMTP_PASSWORD`, an unusable `SMTP_URL` or `SMTP_ROOT_CA`, an unparsable `SMTP_FROM`) hit an `expect()` and aborted with the storage layer live. Exhausted connection retries called `shutdown().await.unwrap()` and then `panic!`: under the patched Hiqlite `shutdown()` reports a failed stop, so the `unwrap()` became a second abort site. All of these now shut the storage layer down and exit `1` with the reason logged; a failed shutdown is logged, not unwrapped. | Measured: `SMTP_URL` without `SMTP_USERNAME` exits 134 on the unfixed tree and the next start reports 3 unclean-shutdown markers. Acceptance S (three cases, 12 assertions): 5 of them fail on the unfixed tree |
+| F17 | **New, found by review round 12.** `DB::connect_postgres` runs inside `DB::init()` after the Hiqlite node has started. A `PG_TLS_ROOT_CA` with a PEM block that does not decode `panic!`ed, and a certificate rustls refuses hit an `expect()`: both aborted with the node live, past the shutdown F10 put around that window. Both are now errors. | Acceptance C, two cases: exit 134 and an unclean next start on the unfixed tree (4 of 6 assertions fail), exit 1 and a clean next start fixed |
+| F18 | **New, found by a sweep after round 12.** Settings upstream only acts on after `DB::init()`, where an invalid value panicked: a zero user-expiry, email-job or dynamic-client cleanup interval, a cron expression that parses but never fires again, a Matrix user without a room or credentials, an unknown `TZ_FALLBACK`, S3 picture storage without its settings or with an unparsable URL, file picture storage on more than one node, `MIGRATE_DB_FROM` naming Postgres without `MIGRATE_PG_*`. Config validation now refuses each before a data directory exists. | Acceptance T, five of them: on the unfixed tree each starts the storage layer and then aborts |
+| F19 | **New, the safety net for the rest.** The sweep also found panics after `DB::init()` that validation cannot decide: bootstrap file contents, a database older than `0.35.0`, `MIGRATE_DB_FROM` contents, Matrix and S3 reachability at boot, plus the unaudited per-request surface. A panic hook installed once `DB::init()` succeeds now asks for a bounded (20 s) storage shutdown from its own thread, then lets the abort proceed: the exit code stays `134`, because a panic is a bug, but the data directory is left clean. A second panic aborts at once. | Acceptance T: an invalid `BOOTSTRAP_API_KEY`, still an `expect()`, exits 134 after "The storage layer was shut down after the panic", and the next start reports no unclean shutdown; both assertions fail on the unfixed tree |
 
 ### 3.2 Test defects and coverage gaps (no product change)
 
@@ -128,13 +131,16 @@ Reported to the Hiqlite release owner with evidence; repaired in `bartekus/hiqli
   grant, WebAuthn, upstream providers) read the user and save the whole row. A login that read the
   user before a concurrent picture upload saves it back without the picture. Present in upstream
   `v0.36.2`, unrelated to storage, and outside this release's scope; a candidate for upstream.
-- **The per-request `panic = "abort"` surface** in `src/api`, `src/service` and `src/data` was
-  spot-checked, not audited (unchanged from PR #2). F15 and F16 closed the startup and background
-  paths found since; still present: the Microsoft Graph mail sender `expect()`s its OAuth token on
-  every send, and the SMTP sender `unwrap()`s each recipient address, which upstream validates
-  before it queues a mail.
-- **Config-layer aborts.** Config errors abort the process before `DB::init()`; nothing is at
-  stake, but a supervisor sees an abort, not a clean exit.
+- **The remaining `panic = "abort"` surface.** Not audited site by site. What configuration can
+  reach at startup is an error (F2, F7 to F10, F15 to F17) or refused before storage starts (F18).
+  Everything else, including the per-request code, the Microsoft Graph sender's token `expect()`,
+  the SMTP sender's recipient `unwrap()`s, bootstrap file contents and a too-old database, still
+  aborts with `134`, now after a bounded storage shutdown (F19). Limit of F19: the shutdown runs on
+  the runtime's other workers, so on a single-worker runtime (one CPU, where the panicking thread
+  is that worker) it times out after 20 s and the data directory is left as upstream would leave
+  it.
+- **Config-layer aborts.** Config errors, including F18's, abort the process before `DB::init()`;
+  nothing is at stake, but a supervisor sees an abort, not a clean exit.
 
 ### Contracts traced that needed no change
 
@@ -258,7 +264,8 @@ own data directory and ports.
 |---|---|---|---|
 | Release identity, version output | A | n/a | `--version`, marker handling |
 | First boot, production frontend | B | Hiqlite | ready, health, JWKS, identity; the served index references a built bundle and the bundle and `/account` are served |
-| Bad configuration, bind failure with cleanup | C, D, M3, S | both (M3 and S: Hiqlite) | F4, F9, F10, F2, F15, F16 |
+| Bad configuration, bind failure with cleanup | C, D, M3, S, T | both (M3, S, T: Hiqlite) | F4, F9, F10, F2, F15 to F18 |
+| A panic after storage started | T | Hiqlite | F19: bounded storage shutdown, abort, clean next start |
 | Real competing processes | E | Hiqlite | `StorageInUse`, first node unharmed |
 | Normal shutdown, restart | F | Hiqlite | clean exit `0`, no unclean markers, keys survive |
 | Interrupted run, recovery | Q | Hiqlite | SIGKILL under write load; the next start must report the unclean shutdown; acknowledged writes, keys and identity survive; the recovered node shuts down cleanly |
@@ -295,6 +302,8 @@ and cannot qualify publication.
 | Hiqlite `e1e91355` (tip `f5323a2c`) | CI run `35775723599`, every job | acceptance **117 passed, 0 failed, 0 skipped, strict** on amd64 and on arm64; integration suites green on both backends; Rahi's whole live suite 606 passed, 0 failed, 1 ignored by Rahi itself, no skips, passkey-only backup administrator proof passing. The last scratch run: the graph is git-sourced, so it cannot qualify publication |
 | **published `0.15.0-patched.1`** (tip `00e411ed`) | CI run `35796064248`, every job, first attempt | acceptance **117 passed, 0 failed, 0 skipped, strict** on amd64 and on arm64; both integration suites; Rahi 606 passed, 0 failed, 1 ignored by Rahi. The registry graph, but not the final tree: review round 11 then found F15, and F16 was found tracing the shutdown contract, so it does not qualify publication |
 | M3 and S only, published Hiqlite | local, macOS arm64, debug build | 16 passed, 0 failed with F15 and F16; 8 passed, 8 failed with both reverted (the unfixed tree exits 134 in all four cases) |
+| published `0.15.0-patched.1` (tip `2227073f`) | CI run `35810812490` | acceptance green on amd64 and arm64 with M3 and S; superseded by round 12 |
+| C's root CA cases and T, published Hiqlite | local, macOS arm64, debug build | 20 passed, 0 failed with F17 to F19; on `00e411ed` 9 passed, 11 failed |
 | Hiqlite `c7d0d6a9` | CI run `35764291279`, consumer job | Rahi's whole live suite: 606 passed, 0 failed, 1 ignored by Rahi itself, no skips; the passkey-only backup administrator proof ran and passed |
 
 The qualifying run is the one section 7 names, on the merge commit, against the published graph.
@@ -416,6 +425,13 @@ Following the second finding through the patched Hiqlite's changed `shutdown()` 
 in the mail sender, and the gate's acceptance of the best review rather than every review
 (section 3.3). The candidate run on the same head, `35796064248`, was green in every job; it is
 superseded because the tree changed.
+
+**Round 12** (review run `35810816253`, head `2227073f`): `VERDICT: blocking findings`, one, real.
+The Postgres root CA was still parsed with `expect()` and `panic!` inside the window F10 claimed
+to have closed. Reproduced in both forms and fixed as F17. Because rounds 8, 11 and 12 each found
+another panic site of the same class, the next step was a sweep of every operator-reachable panic
+after `DB::init()`, not a third one-site fix. It listed about 25; F18 refuses the ones validation
+can decide, and F19 is the safety net for the rest (section 3.5 states its limit).
 
 The final head gets its own review round before merge; the publish gate requires every review run
 on that exact head to be a successful first attempt.

@@ -103,9 +103,10 @@ an environment-only deployment is unaffected. The build stamps `0.36.2-patched.1
   shutdown, where upstream aborted with `134` and the next start rebuilt the state machine:
   a listener or metrics port that cannot bind, unusable TLS material, a `PUB_URL` host that
   cannot name a self-signed certificate, an incomplete SMTP configuration or an unparsable
-  `SMTP_FROM`, and exhausted SMTP connection retries (which upstream also ended, with `134`, after
-  its own shutdown). A supervisor that restarts on any non-zero exit sees no difference; one that
-  inspects the code sees `1`.
+  `SMTP_FROM`, an unusable `PG_TLS_ROOT_CA`, and exhausted SMTP connection retries (which upstream
+  also ended, with `134`, after its own shutdown). A supervisor that restarts on any non-zero exit
+  sees no difference; one that inspects the code sees `1`. Any other panic still exits `134`, but
+  only after the storage layer has been shut down.
 
 ## Backup, restore and downgrade
 
@@ -132,8 +133,8 @@ on the registry graph ran on a tree that has since changed. What the qualifying 
 native amd64 and arm64, strict (a skip fails it):
 
 - both integration suites (Hiqlite and Postgres backends);
-- the process-level legs A to S, including the self-signed certificate and mail exit paths (M3,
-  S), a real embedded-storage failure (P), a real Postgres failure (K), a kill under write load
+- the process-level legs A to T, including the self-signed certificate, mail and Postgres root CA
+  exit paths (M3, S, C), settings refused before storage and the panic safety net (T), a real embedded-storage failure (P), a real Postgres failure (K), a kill under write load
   (Q), a restore aimed at an owned directory (R), and the upgrade and rollback against the real upstream `v0.36.2` binary from its own image (J);
 - rahi's own whole live suite at `b815b18c`, with `RAHI_REQUIRE_RAUTHY=1`, against an image built
   from the candidate bytes, which includes rahi's passkey-only backup administrator proof. amd64
@@ -145,8 +146,12 @@ native amd64 and arm64, strict (a skip fails it):
 - Qualified at N = 1 only.
 - Hiqlite snapshot readability across the upgrade and the rollback rests on source, because no
   snapshot existed during either check.
-- `panic = "abort"` is workspace-wide; the per-request surface is spot-checked, not audited.
-- Config errors abort the process before storage starts.
+- `panic = "abort"` is workspace-wide and the remaining panic surface is not audited site by site.
+  A panic after the storage layer started now exits `134` after a bounded storage shutdown, so the
+  next start is clean; on a single-CPU runtime that shutdown cannot run and times out after 20 s.
+- Config errors abort the process before storage starts. That now includes settings upstream only
+  failed on later: a zero scheduler interval, a cron that never fires again, a Matrix user without
+  a room or credentials, an unknown `TZ_FALLBACK`, incomplete S3 picture settings.
 - Upstream's lost update on the user row (a login concurrent with a profile-picture upload can drop
   the picture) is present and not changed.
 

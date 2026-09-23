@@ -470,6 +470,16 @@ another panic site of the same class, the next step was a sweep of every operato
 after `DB::init()`, not a third one-site fix. It listed about 25; F18 refuses the ones validation
 can decide, and F19 is the safety net for the rest (section 3.5 states its limit).
 
+**Round 13** (review run `35815196727`, head `e428b322`): `VERDICT: no blocking findings`. PR #3
+merged as `60e0f28b`; section 7 records its publication attempt.
+
+**Round 14** (review run `35824500935`, head `d3c57554`, PR #4): `VERDICT: blocking findings`, one,
+real. The version bump to `patched.2` broke a unit test that asserted the patch level was the
+literal `1`; the same head's candidate run `35824497305` failed its integration jobs on exactly
+that test. The test now asserts a patch level of at least `1`. The candidate's style job had
+passed because it does not run that crate's unit tests; the whole workspace's unit tests were run
+locally before the fix was pushed.
+
 The final head gets its own review round before merge; the publish gate requires every review run
 on that exact head to be a successful first attempt.
 

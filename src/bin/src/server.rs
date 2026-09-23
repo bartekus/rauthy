@@ -38,6 +38,7 @@ use std::cmp::max;
 use std::error::Error;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -112,6 +113,7 @@ pub async fn run(
     DB::init(node_config)
         .await
         .map_err(|err| format!("Cannot start the database / cache layer: {err}"))?;
+    shut_storage_down_on_panic();
 
     // From here on the storage layer is live and owns this data directory. Every exit path,
     // successful or not, must go through the shutdown below. Returning early instead would leave
@@ -135,6 +137,56 @@ pub async fn run(
     }
 
     served
+}
+
+/// How long a panic waits for the storage shutdown before the abort goes ahead. Hiqlite bounds its
+/// own shutdown at 15 s.
+const PANIC_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
+
+/// Makes a panic shut the storage layer down before the process aborts.
+///
+/// Every known panic reachable from configuration after `DB::init()` is either an error or
+/// refused during config validation, but the per-request and background surface of this
+/// workspace is not audited, and under `panic = "abort"` any panic that is left ends the process
+/// with the storage layer live, which the next start reads as an ungraceful shutdown. The hook
+/// still runs before the abort, so it asks for a bounded shutdown from a separate thread, then
+/// lets the abort proceed: a panic is a bug and the exit code keeps saying so.
+///
+/// The shutdown needs other runtime workers to make progress. On a runtime with a single worker,
+/// where the panicking thread is that worker, it times out and the abort goes ahead as before.
+fn shut_storage_down_on_panic() {
+    let handle = tokio::runtime::Handle::current();
+    let previous = std::panic::take_hook();
+    let started = AtomicBool::new(false);
+
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        // A second panic, including one inside the shutdown itself, aborts without waiting.
+        if started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        eprintln!("A panic with the storage layer running - shutting it down before aborting");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = handle.clone();
+        let spawned = thread::Builder::new()
+            .name("panic-storage-shutdown".to_string())
+            .spawn(move || {
+                let _ = tx.send(handle.block_on(DB::hql().shutdown()));
+            });
+        if spawned.is_err() {
+            eprintln!("Cannot start the storage shutdown after a panic");
+            return;
+        }
+        match rx.recv_timeout(PANIC_SHUTDOWN_WAIT) {
+            Ok(Ok(())) => eprintln!("The storage layer was shut down after the panic"),
+            Ok(Err(err)) => eprintln!("The storage shutdown after the panic failed: {err}"),
+            Err(_) => eprintln!(
+                "The storage shutdown after the panic did not finish within {}s",
+                PANIC_SHUTDOWN_WAIT.as_secs()
+            ),
+        }
+    }));
 }
 
 /// Everything that runs while the storage layer is live.

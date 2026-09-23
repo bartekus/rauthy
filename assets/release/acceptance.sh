@@ -734,6 +734,51 @@ mail_exit_case "an SMTP_FROM that is not a mailbox" "$WORK/s3-smtp-bad-from" \
   'SMTP_FROM could not be parsed' SMTP_URL=127.0.0.1 SMTP_PORT=1 SMTP_USERNAME=user \
   SMTP_PASSWORD=password "SMTP_FROM=not a mailbox"
 
+# --- T: settings refused before storage, and the panic safety net -------------
+
+log "T. Settings that upstream acts on after the storage layer starts are refused before it"
+# Each of these reached a panic after `DB::init()` in upstream v0.36.2. They are now refused by
+# config validation, before a data directory exists.
+t_refused() {
+  local name="$1" dir="$2"; shift 2
+  local rc
+  mkdir -p "$dir"
+  run_until_exit "$dir" 8077 8127 8227 120 "$@"
+  rc=$?
+  [ "$rc" -ne 0 ]
+  assert "$name fails the start" $? "exit code was $rc"
+  [ ! -d "$dir/data/state_machine" ] && [ ! -d "$dir/data/logs" ]
+  assert "$name is refused before the storage layer starts" $? "a data directory exists at $dir/data"
+}
+t_refused "a zero user-expiry interval" "$WORK/t1-sched" SCHED_USER_EXP_MINS=0
+t_refused "a cron expression that never fires again" "$WORK/t2-cron" \
+  "JWK_AUTOROTATE_CRON=0 0 0 1 1 * 2020"
+t_refused "a Matrix user without a room" "$WORK/t3-matrix" "EVENT_MATRIX_USER_ID=@bot:localhost" \
+  EVENT_MATRIX_ACCESS_TOKEN=token
+t_refused "an unknown fallback time zone" "$WORK/t4-tz" TZ_FALLBACK=Mars/Olympus_Mons
+t_refused "S3 picture storage without its settings" "$WORK/t5-pic" PICTURE_STORAGE_TYPE=s3
+
+# A panic that is still reachable after `DB::init()`: an API key bootstrapped with an invalid
+# name is validated with `expect()` during the first start's bootstrap. The process still aborts,
+# because a panic is a bug, but the panic hook shuts the storage layer down first.
+log "T. A panic after the storage layer started shuts it down before the abort"
+TP="$WORK/t6-panic"; mkdir -p "$TP"
+BAD_KEY="$(printf '%s' '{"name":"not a valid name","exp":null,"access":[]}' | base64 | tr -d '\n')"
+run_until_exit "$TP" 8076 8128 8228 300 "BOOTSTRAP_API_KEY=$BAD_KEY"
+RC=$?
+[ "$RC" -eq 134 ]
+assert "the panic still aborts the process" $? "exit code was $RC"
+grep -q 'The storage layer was shut down after the panic' "$TP/rauthy.log"
+assert "the panic hook shut the storage layer down" $? "$(tail -4 "$TP/rauthy.log")"
+mv "$TP/rauthy.log" "$TP/panic.log"
+start_node "$TP" 8076 8128 8228
+wait_ready "$TP" 8076 300
+assert "the node starts after the panic" $? "see $TP/rauthy.log"
+[ "$(unclean_markers "$TP")" = "0" ]
+assert "the next start after the panic is clean" $? \
+  "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$TP/rauthy.log" | head -3)"
+stop_node "$TP"
+
 # --- L: the metrics listener is an exit path too ------------------------------
 
 log "L. A metrics listener that cannot start fails cleanly"

@@ -159,9 +159,33 @@ pub struct EncKeysResponse<'a> {
 }
 
 #[derive(Default, Serialize, ToSchema)]
+#[cfg_attr(debug_assertions, derive(Deserialize))]
 pub struct HealthResponse {
     pub db_healthy: bool,
     pub cache_healthy: bool,
+    pub storage: StorageState,
+}
+
+/// The state of this node's storage layer.
+///
+/// `terminal` is the only final state: the embedded Hiqlite node has recorded a terminal failure,
+/// refuses every storage operation and never leaves that state while this process lives.
+/// Restarting the process is the recovery path. Every other state can change without a restart.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[cfg_attr(debug_assertions, derive(Deserialize))]
+#[serde(rename_all = "lowercase")]
+pub enum StorageState {
+    /// Not sampled: the answer was given inside `HEALTH_CHECK_DELAY_SECS`, where `db_healthy`
+    /// and `cache_healthy` are reported `true` without a check.
+    #[default]
+    Unknown,
+    /// Both storage layers answered this request's check.
+    Ok,
+    /// A storage layer failed this request's check, and nothing terminal is recorded. This
+    /// includes an unreachable Postgres, which never becomes `terminal`.
+    Degraded,
+    /// The embedded Hiqlite node is out of service until this process is restarted.
+    Terminal,
 }
 
 #[derive(Serialize, ToSchema)]

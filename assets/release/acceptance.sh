@@ -188,6 +188,11 @@ jwks_kid() {
     | tr ',' '\n' | grep -o '"kid":"[^"]*"' | sort | tr '\n' ' '
 }
 
+# storage_state <http-port> - prints the `storage` field of /health, or nothing.
+storage_state() {
+  curl -s "http://127.0.0.1:$1/auth/v1/health" | grep -o '"storage":"[a-z]*"' | cut -d'"' -f4
+}
+
 # Helpers that outlive a scenario if the run is killed: the port squatters and the Postgres
 # container. Tracked here so a cancelled run does not leak either onto a reused runner and fail
 # the next one for an unrelated reason.
@@ -823,8 +828,12 @@ stop_node "$L"
 log "K. Observable unavailability after a critical storage failure"
 DOCKER="$(command -v docker || command -v podman || true)"
 if [ -z "$DOCKER" ]; then
-  skip "readiness reports a storage failure" "no container runtime for the failure injection"
-  skip "health reports a storage failure" "no container runtime for the failure injection"
+  for k_leg in "readiness reports a storage failure" "health reports a storage failure" \
+    "a Postgres failure is reported degraded, not terminal" \
+    "health returns to storage ok once Postgres is back, without a restart" \
+    "readiness returns once Postgres is back, without a restart"; do
+    skip "$k_leg" "no container runtime for the failure injection"
+  done
 else
   # Postgres is the backend that can be taken away from a running rauthy deterministically: stop
   # the container and every database call fails, which is what a terminal storage failure looks
@@ -847,10 +856,17 @@ else
   RC=$?
   if [ "$RC" -ne 0 ]; then
     bad "the Postgres-backed node comes up" "see $K/rauthy.log"
-    skip "readiness reports a storage failure" "the node never came up"
-    skip "health reports a storage failure" "the node never came up"
+    for k_leg in "readiness reports a storage failure" "health reports a storage failure" \
+      "a Postgres failure is reported degraded, not terminal" \
+      "health returns to storage ok once Postgres is back, without a restart" \
+      "readiness returns once Postgres is back, without a restart"; do
+      skip "$k_leg" "the node never came up"
+    done
   else
     ok "the Postgres-backed node comes up"
+    K_STATE="$(storage_state 8090)"
+    [ "$K_STATE" = "ok" ]
+    assert "health reports storage ok on a healthy Postgres-backed node" $? "storage: $K_STATE"
     "$DOCKER" stop "$PGC" >/dev/null 2>&1
 
     # The health watcher confirms a failed probe before acting on it, so give it its first tick
@@ -867,6 +883,39 @@ else
     HEALTH_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8090/auth/v1/health")"
     [ "$HEALTH_CODE" = "500" ]
     assert "health reports a storage failure" $? "/health answered $HEALTH_CODE"
+    # An unreachable Postgres is recoverable: it must never be labelled terminal, which is the
+    # embedded node's state alone.
+    K_STATE="$(storage_state 8090)"
+    [ "$K_STATE" = "degraded" ]
+    assert "a Postgres failure is reported degraded, not terminal" $? "storage: $K_STATE"
+
+    # The same process, with the database back: no restart.
+    "$DOCKER" start "$PGC" >/dev/null 2>&1
+    for _ in $(seq 1 60); do
+      "$DOCKER" exec "$PGC" pg_isready -U rauthy >/dev/null 2>&1 && break
+      sleep 1
+    done
+    K_STATE=""
+    for _ in $(seq 1 30); do
+      K_STATE="$(storage_state 8090)"
+      [ "$K_STATE" = "ok" ] && break
+      sleep 2
+    done
+    [ "$K_STATE" = "ok" ]
+    assert "health returns to storage ok once Postgres is back, without a restart" $? \
+      "storage: $K_STATE"
+    READY_CODE=503
+    for _ in $(seq 1 45); do
+      READY_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8090/auth/v1/ready")"
+      [ "$READY_CODE" = "200" ] && break
+      sleep 2
+    done
+    [ "$READY_CODE" = "200" ]
+    assert "readiness returns once Postgres is back, without a restart" $? \
+      "/ready still answered $READY_CODE"
+    [ -f "$K/rc" ]
+    [ $? -ne 0 ]
+    assert "the Postgres-backed node was not restarted" $? "exit code $(cat "$K/rc" 2>/dev/null)"
   fi
   stop_node "$K"
   "$DOCKER" rm -f "$PGC" >/dev/null 2>&1
@@ -986,6 +1035,9 @@ else
   start_node "$P" 8084 8114 8214 HQL_WAL_SIZE=262144
   wait_ready "$P" 8084 300
   assert "the node whose storage will fail is serving" $? "see $P/rauthy.log"
+  P_STATE="$(storage_state 8084)"
+  [ "$P_STATE" = "ok" ]
+  assert "health reports storage ok on a fresh node" $? "storage: $P_STATE"
   [ "$(create_group 8084 acceptance_before_failure)" = "200" ]
   assert "a write succeeds before the failure" $?
   KID_P="$(jwks_kid 8084)"
@@ -1025,6 +1077,21 @@ else
   HEALTH_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8084/auth/v1/health")"
   [ "$HEALTH_CODE" = "500" ]
   assert "health reports the embedded storage failure" $? "/health answered $HEALTH_CODE"
+  P_STATE="$(storage_state 8084)"
+  [ "$P_STATE" = "terminal" ]
+  assert "health reports the embedded storage failure as terminal" $? "storage: $P_STATE"
+  # Terminal is final for the process. Rahi's R-1 asks for three more samples; each is taken at
+  # least one health-watcher interval (30 s) after the last, so that every sample follows a
+  # watcher tick. Nothing in the watcher is expected to clear it: this checks the contract end to
+  # end rather than a known way for it to fail.
+  P_PERSIST=0
+  for i in 1 2 3; do
+    sleep 31
+    P_STATE="$(storage_state 8084)"
+    [ "$P_STATE" = "terminal" ] || { P_PERSIST=1; break; }
+  done
+  assert "terminal persists across three more watcher intervals" $P_PERSIST \
+    "sample $i answered storage: $P_STATE"
   [ "$(create_group 8084 acceptance_after_failure)" != "200" ]
   assert "a write after the failure is refused" $?
   kill -0 "$(cat "$P/pid")" 2>/dev/null
@@ -1053,6 +1120,9 @@ else
   start_node "$P" 8084 8114 8214 HQL_WAL_SIZE=262144
   wait_ready "$P" 8084 300
   assert "the node recovers once its storage is writable again" $? "see $P/rauthy.log"
+  P_STATE="$(storage_state 8084)"
+  [ "$P_STATE" = "ok" ]
+  assert "a restart after the fault is cleared reports storage ok" $? "storage: $P_STATE"
   group_exists 8084 acceptance_before_failure
   assert "a write acknowledged before the failure survives it" $?
   [ "$(jwks_kid 8084)" = "$KID_P" ]
@@ -1060,6 +1130,54 @@ else
   [ "$(create_group 8084 acceptance_after_recovery)" = "200" ]
   assert "the recovered node accepts writes again" $?
   stop_node "$P"
+fi
+
+# --- U: a terminal failure inside the startup health window -------------------
+
+log "U. A terminal failure inside HEALTH_CHECK_DELAY_SECS"
+# Inside the window /health does not check storage and reports both layers healthy, so a
+# terminal failure there has to come from Hiqlite's own record, not from a check. Same injection
+# as leg P.
+if [ "$(id -u)" = "0" ]; then
+  skip "a terminal failure inside the startup window is reported" \
+    "running as root, a read-only directory is not enforced"
+else
+  U="$WORK/u-early-terminal"
+  start_node "$U" 8075 8125 8225 HQL_WAL_SIZE=262144 HEALTH_CHECK_DELAY_SECS=3600
+  wait_ready "$U" 8075 300
+  assert "the node with a one-hour health window is serving" $? "see $U/rauthy.log"
+  U_STATE="$(storage_state 8075)"
+  U_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8075/auth/v1/health")"
+  [ "$U_STATE" = "unknown" ] && [ "$U_CODE" = "200" ]
+  assert "inside the window health answers 200 and storage unknown" $? \
+    "/health answered $U_CODE, storage: $U_STATE"
+  chmod a-w "$U/data/logs"
+  U_FAILED=1
+  for i in $(seq 1 3000); do
+    [ "$(create_group 8075 "acceptance_fill_$i")" != "200" ] && { U_FAILED=0; break; }
+  done
+  assert "the injected storage failure reaches the writer inside the window" $U_FAILED \
+    "3000 writes were all accepted"
+  # Hiqlite records the failure from its own watcher task, so allow it a moment, as leg P does.
+  for _ in $(seq 1 10); do
+    U_STATE="$(storage_state 8075)"
+    [ "$U_STATE" = "terminal" ] && break
+    sleep 1
+  done
+  U_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8075/auth/v1/health")"
+  [ "$U_STATE" = "terminal" ] && [ "$U_CODE" = "500" ]
+  assert "inside the window a terminal failure is reported terminal with 500" $? \
+    "/health answered $U_CODE, storage: $U_STATE"
+  U_READY="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8075/auth/v1/ready")"
+  [ "$U_READY" = "503" ]
+  assert "inside the window readiness answers 503 after a terminal failure" $? \
+    "/ready answered $U_READY"
+  # The body carries the state and nothing of the failure's account.
+  U_BODY="$(curl -s "http://127.0.0.1:8075/auth/v1/health")"
+  ! grep -q "$U/data" <<< "$U_BODY"
+  assert "health exposes no storage path" $? "$U_BODY"
+  stop_node "$U"
+  chmod u+w "$U/data/logs"
 fi
 
 # --- summary -----------------------------------------------------------------

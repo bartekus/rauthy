@@ -3,10 +3,11 @@
 For the session that adopts this build in `rahi`. The evidence is in `RELEASE-LEDGER.md`; this file
 is what a consumer needs to act.
 
-> **Pin from the release's `RELEASE-PROVENANCE.md`, never from this file.** This copy is the one
-> in the tagged tree, written before the publish run produced the artefacts. Everything below is
-> final except those values: the image digests, the binary checksums and the run links. The copy
-> on `patched/0.36.2` records them once the release exists.
+> **Published 2026-09-23.** Release https://github.com/bartekus/rauthy/releases/tag/v0.36.2-patched.2,
+> tag `v0.36.2-patched.2` at `17132b9451912cf45d33c99990f21678b75e2e26`. Pin:
+> `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.2@sha256:ea114a8bb743d578dea6d7800916ee43550939c749a2cf586f9abdc0d0c52478`.
+> The release's own `RELEASE-PROVENANCE.md` carries the same values; the copy of this file attached
+> to the release predates them. Per-platform digests, checksums and runs: ledger section 7.
 
 > **Never pin `0.36.2-patched.1`.** An image with that tag exists in the registry from a publish
 > run whose arm64 verification failed on a harness defect; it was never released and has no
@@ -47,11 +48,14 @@ only requires a `@sha256:` pin, so the namespace change passes its gate unchange
 ARG RAUTHY_IMAGE=ghcr.io/sebadob/rauthy:0.36.2@sha256:f7d3c501402165e023edbd958b032b41c9cfdac5ea7f8ca7d62217327145577e
 ```
 
-become, with the index digest from `RELEASE-PROVENANCE.md`:
+become:
 
 ```dockerfile
-ARG RAUTHY_IMAGE=ghcr.io/bartekus/rauthy-patched:0.36.2-patched.2@sha256:<index-digest>
+ARG RAUTHY_IMAGE=ghcr.io/bartekus/rauthy-patched:0.36.2-patched.2@sha256:ea114a8bb743d578dea6d7800916ee43550939c749a2cf586f9abdc0d0c52478
 ```
+
+Both lines were re-read from `statecrafting/rahi` on 2026-09-23 and still carry the upstream pin
+shown above, at lines 12 and 22.
 
 Update the comment above the line in `docker/Dockerfile` ("rauthy 0.36.2, pinned by the digest of
 its multi-architecture index") to name the patched build and its upstream base.
@@ -161,10 +165,8 @@ native amd64 and arm64, strict (a skip fails it):
 
 ## What is still missing
 
-**Possibly one owner action:** if the GHCR package is private after the first push,
-https://github.com/users/bartekus/packages/container/rauthy-patched/settings -> Change package
-visibility -> Public. The publish run checks anonymously and says so. Nothing else outside this
-repository blocks publication.
+Nothing on the Rauthy side. The package is public and was pulled, inspected and started without
+credentials on both platforms. What remains is adoption, below.
 
 ## Explicitly outside this release
 

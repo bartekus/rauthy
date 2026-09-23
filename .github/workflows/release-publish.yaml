@@ -223,13 +223,25 @@ jobs:
             echo "the merge of #$pr does not carry the tree its reviewed head had" >&2
             exit 1
           fi
-          review_run="$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/$REVIEW_WORKFLOW/runs?head_sha=$head&status=success" \
-            --jq '.workflow_runs[0].id // empty')"
-          if [ -z "$review_run" ]; then
-            echo "no successful $REVIEW_WORKFLOW run on the reviewed head $head of #$pr" >&2
-            exit 1
-          fi
+          # Every review of this head counts, not the best one. A review is a judgement, and a
+          # blocking verdict followed by a green rerun or a dispatched second opinion is the same
+          # green-by-rerun a candidate run is refused for. A head that drew a blocking verdict
+          # needs a new commit that addresses it.
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$REVIEW_WORKFLOW/runs?head_sha=$head&per_page=100" \
+            --jq '.workflow_runs[] | {id, event, status, conclusion, run_attempt}' > reviews.jsonl
+          review_run="$(python3 - "$head" <<'PYEOF'
+          import json, sys
+          runs = [json.loads(l) for l in open("reviews.jsonl") if l.strip()]
+          bad = [r for r in runs if (r["event"], r["status"], r["conclusion"], r["run_attempt"])
+                 != ("pull_request", "completed", "success", 1)]
+          if not runs or bad:
+              print(f"the reviewed head {sys.argv[1]} does not have exactly clean reviews: "
+                    f"{runs or 'none'}", file=sys.stderr)
+              sys.exit(1)
+          print(max(r["id"] for r in runs))
+          PYEOF
+          )"
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
           echo "head=$head" >> "$GITHUB_OUTPUT"
           echo "run=$review_run" >> "$GITHUB_OUTPUT"

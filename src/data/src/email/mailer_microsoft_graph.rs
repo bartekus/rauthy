@@ -1,4 +1,4 @@
-use crate::email::mailer::EMail;
+use crate::email::mailer::{EMail, exit_after_storage_shutdown};
 use crate::email::smtp_oauth_token::SmtpOauthToken;
 use crate::events::event::Event;
 use crate::rauthy_config::RauthyConfig;
@@ -57,13 +57,16 @@ struct MicrosoftMessage<'a> {
 
 pub async fn sender_microsoft_graph(mut rx: mpsc::Receiver<EMail>) {
     let from = {
-        let from: message::Mailbox = RauthyConfig::get()
-            .vars
-            .email
-            .smtp_from
-            .as_ref()
-            .parse()
-            .expect("SMTP_FROM could not be parsed correctly");
+        let from: message::Mailbox = match RauthyConfig::get().vars.email.smtp_from.as_ref().parse()
+        {
+            Ok(from) => from,
+            Err(err) => {
+                exit_after_storage_shutdown(&format!(
+                    "SMTP_FROM could not be parsed correctly: {err}"
+                ))
+                .await
+            }
+        };
 
         Recipient {
             email_address: EmailAddr {

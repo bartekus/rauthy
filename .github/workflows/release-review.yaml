@@ -76,22 +76,41 @@ jobs:
             4. Backup, restore and upgrade safety: truncation, partial writes, destroying the last
                recoverable state, and the version stamped into the database locking out a
                rollback to upstream v0.36.2.
-            5. Dependency and package provenance: whether anything resolves to an unexpected
-               source. Note that the patched Hiqlite packages this release is meant to consume are
-               not published yet, which `RELEASE-LEDGER.md` section 7 records as a hold; that is
-               known, not a finding.
-            6. Workflow permissions and publication correctness: over-broad `permissions`, a
-               credential reachable from untrusted code, or a publication destination that is not
-               under the bartekus namespace.
+            5. Dependency and package provenance. This release consumes `hiqlite-patched`,
+               `hiqlite-wal-patched` and `hiqlite-derive-patched` from crates.io through a Cargo
+               package alias. Any Hiqlite package that resolves from a path, a git source, or
+               under upstream's own `hiqlite*` names, or a second copy of any of them or of
+               `openraft`, is a blocking finding. Read `Cargo.lock`, not just `Cargo.toml`.
+            6. The Hiqlite lifecycle contract as Rauthy's callers use it: typed startup errors,
+               cleanup after a partial initialization in `DB::init`, readiness after a terminal
+               node failure (`Client::node_failure`), refusal of operations after one, and the
+               bounded shutdown. Check `git diff origin/patched/0.36.2...HEAD` for what changed
+               since the last reviewed state of the release line, and review that diff hardest.
+            7. Workflow permissions and publication correctness: over-broad `permissions`, a
+               credential reachable from untrusted code, a publication destination that is not
+               under the bartekus namespace, and whether `release-publish.yaml` can be made to
+               promote anything other than a green, strict, first-attempt candidate run of this
+               repository on the exact reviewed commit.
+            8. Acceptance legs that cannot fail. An assertion that passes whatever the product
+               does is worse than none, because the ledger cites it as evidence.
 
             `RELEASE-LEDGER.md` states what this release claims, and `RELEASE-HANDOFF.md` states
             what the consumer is told. Treat a claim in either that the code does not support as a
             finding in its own right.
 
-            End with a one-line verdict: whether you found anything that should block this
-            release. Do not try to post anything yourself: the step after this one takes your
-            final answer and publishes it, so that the review is on the record whether or not you
-            think to put it there.
+            Work in the foreground only. Do not start background tasks and do not wait for
+            notifications: nothing will arrive, and a review that ends while waiting has no
+            verdict.
+
+            The last line of your final answer must be exactly one of these two, and nothing may
+            follow it:
+
+            VERDICT: no blocking findings
+            VERDICT: blocking findings
+
+            Do not try to post anything yourself: the step after this one takes your final answer
+            and publishes it, so that the review is on the record whether or not you think to put
+            it there.
 
       # The first review run finished cleanly and left nothing behind: no comment, no job summary,
       # and the execution log stays on the runner. Publishing the verdict is therefore this
@@ -150,6 +169,16 @@ jobs:
           if [ -n "$PR_NUMBER" ]; then
             gh pr review "$PR_NUMBER" --comment --body-file review.md
           fi
+          # The publish gate accepts a successful run of this workflow on the reviewed head, so a
+          # success must mean a verdict. A reviewer that ended without one (observed: a final
+          # answer of "Still running") or with a blocking one fails the run.
+          verdict="$(grep -E '^VERDICT: ' review.md | tail -1 || true)"
+          echo "verdict line: ${verdict:-none}"
+          case "$verdict" in
+            "VERDICT: no blocking findings") ;;
+            "VERDICT: blocking findings") echo "the review found blocking findings" >&2; exit 1 ;;
+            *) echo "the review produced no verdict" >&2; exit 1 ;;
+          esac
 
       - uses: actions/upload-artifact@v4
         if: always() && steps.review.outputs.execution_file != ''

@@ -62,6 +62,11 @@ impl RauthyConfig {
         if let Err(err) = node_config.is_valid() {
             panic!("Invalid `[cluster]` config: {err}");
         }
+        // Refused at startup by `UserPicture::test_config()` with a panic, after the storage layer
+        // is live; it can be decided here.
+        if vars.user_pictures.storage_type == "file" && node_config.nodes.len() > 1 {
+            panic!("You can only use local file storage for User Pictures for a single instance");
+        }
 
         let listen_scheme = match vars.server.scheme.as_ref() {
             "http" => {
@@ -3588,8 +3593,87 @@ impl Vars {
                 self.geo.maxmind_update_cron.as_ref(),
             ),
         ] {
-            if let Err(err) = cron::Schedule::from_str(expr) {
-                panic!("`{key}` is not a valid cron expression: '{expr}': {err}");
+            match cron::Schedule::from_str(expr) {
+                Err(err) => {
+                    panic!("`{key}` is not a valid cron expression: '{expr}': {err}");
+                }
+                // A valid expression can still have no future occurrence, which the scheduler
+                // would `unwrap()` on its first run.
+                Ok(schedule) if schedule.upcoming(chrono::Utc).next().is_none() => {
+                    panic!("`{key}` never fires again: '{expr}'");
+                }
+                Ok(_) => {}
+            }
+        }
+
+        // More settings that are only acted on after the storage layer is live, where an invalid
+        // value would be a panic with the storage layer running. They are refused here instead.
+        for (key, value) in [
+            (
+                "database.sched_user_exp_mins",
+                self.database.sched_user_exp_mins,
+            ),
+            (
+                "email.jobs.scheduler_interval_seconds",
+                self.email.jobs.scheduler_interval_seconds,
+            ),
+        ] {
+            if value == 0 {
+                panic!("`{key}` must be greater than 0");
+            }
+        }
+        if self.dynamic_clients.enable && self.dynamic_clients.cleanup_interval == 0 {
+            panic!("`dynamic_clients.cleanup_interval` must be greater than 0");
+        }
+        if let Err(err) = chrono_tz::Tz::from_str(&self.email.tz_fmt.tz_fallback) {
+            panic!(
+                "`email.tz_fmt.tz_fallback` is not a valid time zone: '{}': {err}",
+                self.email.tz_fmt.tz_fallback
+            );
+        }
+        if self.events.matrix_user_id.is_some() {
+            if self.events.matrix_room_id.is_none() {
+                panic!("`event.matrix_user_id` is set but `event.matrix_room_id` is not");
+            }
+            if self.events.matrix_access_token.is_none()
+                && self.events.matrix_user_password.is_none()
+            {
+                panic!(
+                    "`event.matrix_user_id` is set but neither `event.matrix_access_token` nor \
+                    `event.matrix_user_password` is"
+                );
+            }
+        }
+        if self.user_pictures.storage_type == "s3" {
+            let pic = &self.user_pictures;
+            for (key, value) in [
+                ("user_pictures.s3_url", &pic.s3_url),
+                ("user_pictures.bucket", &pic.bucket),
+                ("user_pictures.region", &pic.region),
+                ("user_pictures.s3_key", &pic.s3_key),
+                ("user_pictures.s3_secret", &pic.s3_secret),
+            ] {
+                if value.is_none() {
+                    panic!("`user_pictures.storage_type` is `s3` but `{key}` is not set");
+                }
+            }
+            if let Some(url) = &pic.s3_url
+                && let Err(err) = url.parse::<reqwest::Url>()
+            {
+                panic!("`user_pictures.s3_url` is not a valid URL: '{url}': {err}");
+            }
+        }
+        if let Ok(from) = env::var("MIGRATE_DB_FROM")
+            && from.starts_with("postgres")
+        {
+            for (key, value) in [
+                ("MIGRATE_PG_HOST", &self.database.migrate_pg_host),
+                ("MIGRATE_PG_USER", &self.database.migrate_pg_user),
+                ("MIGRATE_PG_PASSWORD", &self.database.migrate_pg_password),
+            ] {
+                if value.is_none() {
+                    panic!("`MIGRATE_DB_FROM` is a Postgres database but `{key}` is not set");
+                }
             }
         }
 

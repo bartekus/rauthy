@@ -302,6 +302,16 @@ impl From<hiqlite::Error> for ErrorResponse {
             hiqlite::Error::WebSocket(err) => {
                 (ErrorResponseType::Connection, err.to_string().into())
             }
+            // The node is out of service after a terminal storage failure and refuses every
+            // operation until it is restarted. The account names internal components and paths,
+            // so it goes to the log and the client gets a message without it.
+            hiqlite::Error::NodeFailed(err) => {
+                error!("Refusing a storage operation, the node is out of service: {err}");
+                (
+                    ErrorResponseType::Database,
+                    "The storage layer of this node is out of service".into(),
+                )
+            }
             err => (ErrorResponseType::Database, err.to_string().into()),
         };
 

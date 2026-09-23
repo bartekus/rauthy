@@ -15,9 +15,13 @@ use tracing::debug;
 static STORAGE_READY: AtomicBool = AtomicBool::new(true);
 
 /// Whether this node's storage layer is ready to serve.
+///
+/// A terminal failure that Hiqlite has recorded is answered immediately rather than at the
+/// watcher's next confirmed sample: it is final by definition, since nothing restarts the failed
+/// component, so there is nothing to debounce and no reason to keep routing to the node meanwhile.
 #[inline]
 pub fn storage_ready() -> bool {
-    STORAGE_READY.load(Ordering::Relaxed)
+    STORAGE_READY.load(Ordering::Relaxed) && DB::hql().node_failure().is_none()
 }
 
 pub async fn watch_health() {

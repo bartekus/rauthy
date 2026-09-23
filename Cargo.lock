@@ -1470,6 +1470,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a1ec0cfec728a79a5109075543131387f911cb4d07716436d7ae20533657a96"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6187e670c346a04bcbf5def0393d57ec0e5ab56565cde6be4a7cbdb6cdc2f3f6"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2799,10 +2808,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "hiqlite"
-version = "0.14.0"
+name = "hiqlite-derive-patched"
+version = "0.15.0-patched.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8711815c093414290a5fcbc0bf74e1e70e3d6ef37e21735000178d25cee6fcf0"
+checksum = "e2380bba9eb80f5d7ecb5a59097b91bed1a3600f9d6e659ad37362e6cb2df077"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "hiqlite-patched"
+version = "0.15.0-patched.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "456c1c117e5c581f6638572f26d9ef7cd567738c578e42ff0c8e09300534e7ca"
 dependencies = [
  "argon2",
  "axum",
@@ -2811,6 +2831,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "constant_time_eq 0.6.0",
  "cron",
  "crossbeam",
  "cryptr",
@@ -2818,11 +2839,12 @@ dependencies = [
  "dotenvy",
  "fastwebsockets",
  "flume",
+ "fs4",
  "futures-util",
  "getrandom 0.4.3",
  "hex",
- "hiqlite-derive",
- "hiqlite-wal",
+ "hiqlite-derive-patched",
+ "hiqlite-wal-patched",
  "hostname",
  "http-body-util",
  "hyper",
@@ -2859,27 +2881,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "hiqlite-derive"
-version = "0.14.0"
+name = "hiqlite-wal-patched"
+version = "0.15.0-patched.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "262ec752546b183ecab006d9a34e2a0811a7141ad0b575cc68c7ac61f30de53e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "hiqlite-wal"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "247fc29e082f38fdf25270f6a5d7148284c9710384c3bce21636608dc104fddf"
+checksum = "024992a08719a870bcef79192ed392cbef758b39caf0a60167541df379a05a9b"
 dependencies = [
  "bincode",
  "byteorder",
  "crc",
  "flume",
  "fs4",
+ "libc",
  "memmap2",
  "openraft",
  "serde",
@@ -5005,7 +5017,7 @@ name = "rauthy-api-types"
 version = "0.36.2-patched.1"
 dependencies = [
  "actix-web",
- "hiqlite",
+ "hiqlite-patched",
  "openssl",
  "openssl-sys",
  "rauthy-common",
@@ -5069,7 +5081,7 @@ dependencies = [
  "atrium-oauth",
  "chrono",
  "chrono-tz",
- "constant_time_eq",
+ "constant_time_eq 0.5.0",
  "cron",
  "cryptr",
  "deadpool 0.12.3",
@@ -5082,7 +5094,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hickory-resolver",
- "hiqlite",
+ "hiqlite-patched",
  "hmac-sha256",
  "hmac-sha512",
  "image",
@@ -5160,7 +5172,7 @@ dependencies = [
  "css-color",
  "deadpool 0.12.3",
  "ed25519-compact",
- "hiqlite",
+ "hiqlite-patched",
  "image",
  "openssl",
  "openssl-sys",
@@ -5277,7 +5289,7 @@ dependencies = [
  "actix-web",
  "chrono",
  "cron",
- "hiqlite",
+ "hiqlite-patched",
  "openssl",
  "openssl-sys",
  "rauthy-common",

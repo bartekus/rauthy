@@ -104,11 +104,13 @@ async fn sender_test_debug(mut rx: mpsc::Receiver<EMail>) {
 
 async fn sender_default_smtp(smtp_url: &str, mut rx: mpsc::Receiver<EMail>) {
     let vars = &RauthyConfig::get().vars.email;
-    let from: message::Mailbox = vars
-        .smtp_from
-        .as_ref()
-        .parse()
-        .expect("SMTP_FROM could not be parsed correctly");
+    let from: message::Mailbox = match vars.smtp_from.as_ref().parse() {
+        Ok(from) => from,
+        Err(err) => {
+            exit_after_storage_shutdown(&format!("SMTP_FROM could not be parsed correctly: {err}"))
+                .await
+        }
+    };
 
     let mut mailer = create_mailer(smtp_url).await;
     loop {
@@ -204,41 +206,49 @@ async fn sender_default_smtp(smtp_url: &str, mut rx: mpsc::Receiver<EMail>) {
 
 /// Connects to SMTP.
 ///
-/// # Panics
-///
-/// If the connection is not possible after retries were exceeded.
+/// If the connection is not possible after retries were exceeded, the storage layer is shut down
+/// and the process exits with `1`. This runs after `DB::init()`, so the shutdown has to come first,
+/// and it must not be a panic: under `panic = "abort"` a panic anywhere in here would end the
+/// process with the storage layer still live.
 async fn create_mailer(smtp_url: &str) -> AsyncSmtpTransport<Tokio1Executor> {
     let vars = &RauthyConfig::get().vars.email;
 
-    let mut conn = if vars.danger_insecure {
-        conn_test_smtp_insecure(smtp_url, vars.smtp_port).await
-    } else {
-        connect_test_smtp(smtp_url, vars.smtp_port).await
-    };
-
     let mut retries = 0;
-    while let Err(err) = conn {
-        error!(?err);
-
-        if retries >= vars.connect_retries {
-            // do a graceful shutdown of the DB before `panic`king
-            if RauthyConfig::get().is_ha_cluster {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            DB::hql().shutdown().await.unwrap();
-
-            panic!("SMTP connection retries exceeded");
-        }
-        retries += 1;
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        conn = if vars.danger_insecure {
+    loop {
+        let conn = if vars.danger_insecure {
             conn_test_smtp_insecure(smtp_url, vars.smtp_port).await
         } else {
             connect_test_smtp(smtp_url, vars.smtp_port).await
+        };
+        match conn {
+            Ok(conn) => return conn,
+            Err(err) => error!(?err),
         }
+
+        if retries >= vars.connect_retries {
+            exit_after_storage_shutdown("SMTP connection retries exceeded").await;
+        }
+        retries += 1;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    conn.unwrap()
+}
+
+/// Ends the process after an unrecoverable mail configuration or connection failure, the storage
+/// layer first. The sender runs after `DB::init()`; see [`create_mailer`].
+pub(crate) async fn exit_after_storage_shutdown(reason: &str) -> ! {
+    error!("{reason} - shutting down");
+    if RauthyConfig::get().is_ha_cluster {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    if let Err(err) = DB::hql().shutdown().await {
+        error!("Error shutting down the database / cache layer: {err}");
+    }
+    std::process::exit(1);
+}
+
+fn smtp_config_err(message: String) -> ErrorResponse {
+    error!("{message}");
+    ErrorResponse::new(ErrorResponseType::Internal, message)
 }
 
 #[tracing::instrument(level = "debug")]
@@ -250,7 +260,7 @@ async fn connect_test_smtp(
     let username = vars
         .smtp_username
         .as_deref()
-        .expect("SMTP_USERNAME is not set")
+        .ok_or_else(|| smtp_config_err("SMTP_USERNAME is not set".to_string()))?
         .trim()
         .to_string();
 
@@ -258,9 +268,11 @@ async fn connect_test_smtp(
     let creds = if vars.smtp_conn_mode == SmtpConnMode::XOauth2 {
         mechanisms.push(Mechanism::Xoauth2);
 
-        let token = SmtpOauthToken::get()
-            .await
-            .expect("Could not retrieve a `client_credntials` token for SMTP XOAUTH2");
+        let token = SmtpOauthToken::get().await.map_err(|err| {
+            smtp_config_err(format!(
+                "Could not retrieve a `client_credentials` token for SMTP XOAUTH2: {err}"
+            ))
+        })?;
         authentication::Credentials::new(username, token.access_token)
     } else {
         mechanisms.push(Mechanism::Plain);
@@ -269,7 +281,7 @@ async fn connect_test_smtp(
         let password = vars
             .smtp_password
             .as_deref()
-            .expect("SMTP_PASSWORD is not set")
+            .ok_or_else(|| smtp_config_err("SMTP_PASSWORD is not set".to_string()))?
             .trim()
             .to_string();
         authentication::Credentials::new(username, password)
@@ -277,24 +289,30 @@ async fn connect_test_smtp(
 
     let mut builder = if vars.starttls_only {
         AsyncSmtpTransport::<lettre::Tokio1Executor>::starttls_relay(smtp_url)
-            .expect("Connection Error with 'SMTP_URL'")
     } else {
         AsyncSmtpTransport::<lettre::Tokio1Executor>::relay(smtp_url)
-            .expect("Connection Error with 'SMTP_URL'")
-    };
+    }
+    .map_err(|err| smtp_config_err(format!("Connection Error with 'SMTP_URL': {err}")))?;
 
     if let Some(port) = smtp_port {
         builder = builder.port(port);
     }
 
     if let Some(root_ca) = &RauthyConfig::get().vars.email.root_ca {
-        let cert = client::Certificate::from_pem(root_ca.as_bytes())
-            .expect("Invalid `email.root_ca` for SMTP connections");
+        let cert = client::Certificate::from_pem(root_ca.as_bytes()).map_err(|err| {
+            smtp_config_err(format!(
+                "Invalid `email.root_ca` for SMTP connections: {err}"
+            ))
+        })?;
 
         let params = client::TlsParameters::builder(smtp_url.to_string())
             .add_root_certificate(cert)
             .build_rustls()
-            .expect("Cannot build TLS parameters with custom `email.root_ca`");
+            .map_err(|err| {
+                smtp_config_err(format!(
+                    "Cannot build TLS parameters with custom `email.root_ca`: {err}"
+                ))
+            })?;
 
         builder = builder.tls(client::Tls::Required(params));
     }

@@ -4,7 +4,7 @@ use cryptr::EncValue;
 use hiqlite::macros::params;
 use rauthy_common::is_hiqlite;
 use rauthy_common::utils::{deserialize, serialize};
-use rauthy_error::ErrorResponse;
+use rauthy_error::{ErrorResponse, ErrorResponseType};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -27,18 +27,31 @@ pub struct SelfSignedCA {
     cert: String,
 }
 
-impl From<&mut hiqlite::Row<'_>> for SelfSignedCA {
+/// The stored CA, still serialized. Deserializing it is fallible and happens after the query, so
+/// that a damaged row becomes an error rather than a panic: this runs after `DB::init()`, where
+/// `panic = "abort"` would skip the storage shutdown.
+struct SelfSignedCARow {
+    data: Vec<u8>,
+}
+
+impl From<&mut hiqlite::Row<'_>> for SelfSignedCARow {
     fn from(row: &mut hiqlite::Row) -> Self {
-        let bytes: Vec<u8> = row.get("data");
-        deserialize(bytes.as_ref()).unwrap()
+        Self {
+            data: row.get("data"),
+        }
     }
 }
 
-impl From<tokio_postgres::Row> for SelfSignedCA {
+impl From<tokio_postgres::Row> for SelfSignedCARow {
     fn from(row: tokio_postgres::Row) -> Self {
-        let bytes: Vec<u8> = row.get("data");
-        deserialize(bytes.as_ref()).unwrap()
+        Self {
+            data: row.get("data"),
+        }
     }
+}
+
+fn cert_err(what: &str, err: rcgen::Error) -> ErrorResponse {
+    ErrorResponse::new(ErrorResponseType::Internal, format!("Cannot {what}: {err}"))
 }
 
 impl SelfSignedCA {
@@ -46,11 +59,12 @@ impl SelfSignedCA {
         let now = OffsetDateTime::now_utc();
 
         let sql = "SELECT data FROM config WHERE id = 'ca'";
-        let slf: Option<Self> = if is_hiqlite() {
+        let row: Option<SelfSignedCARow> = if is_hiqlite() {
             DB::hql().query_map_optional(sql, params!()).await?
         } else {
             DB::pg_query_opt(sql, &[]).await?
         };
+        let slf: Option<Self> = row.map(|row| deserialize(&row.data)).transpose()?;
         if let Some(slf) = slf
             && slf.exp > now.add(Duration::from_secs(3600))
         {
@@ -62,7 +76,7 @@ impl SelfSignedCA {
         let nbf = now.sub(Duration::from_secs(60));
         let exp = now.add(Duration::from_secs(24 * 3600 * 3650));
 
-        let kp = Self::generate_key_pair().await;
+        let kp = Self::generate_key_pair().await?;
         let key_pair = EncValue::encrypt(kp.serialize_pem().as_bytes())?
             .into_bytes()
             .to_vec();
@@ -71,7 +85,10 @@ impl SelfSignedCA {
             key_pair,
             nbf,
             exp,
-            cert: Self::params(nbf, exp).self_signed(&kp).unwrap().pem(),
+            cert: Self::params(nbf, exp)
+                .self_signed(&kp)
+                .map_err(|err| cert_err("self-sign the CA certificate", err))?
+                .pem(),
         };
         let slf_bytes = serialize(&slf)?;
 
@@ -98,7 +115,14 @@ SET data = $2
             pub_url
         };
 
-        let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        // `name` comes from the operator's `PUB_URL`, and a host that is not a valid DNS name
+        // (non-ASCII, for one) is refused here.
+        let mut params = CertificateParams::new(vec![name.to_string()]).map_err(|err| {
+            cert_err(
+                &format!("use the PUB_URL host '{name}' as a certificate name"),
+                err,
+            )
+        })?;
         params.distinguished_name.push(DnType::CommonName, name);
         params.use_authority_key_identifier_extension = true;
         params.key_usages.push(KeyUsagePurpose::DigitalSignature);
@@ -115,8 +139,10 @@ SET data = $2
         let key_pair_ca = self.key_pair()?;
         let iss = Issuer::from_params(&params_ca, &key_pair_ca);
 
-        let key_pair = Self::generate_key_pair().await;
-        let cert = params.signed_by(&key_pair, &iss).unwrap();
+        let key_pair = Self::generate_key_pair().await?;
+        let cert = params
+            .signed_by(&key_pair, &iss)
+            .map_err(|err| cert_err("sign the end-entity certificate", err))?;
 
         let mut cert_chain_pem = cert.pem();
         writeln!(cert_chain_pem, "{}", self.cert)?;
@@ -129,16 +155,22 @@ SET data = $2
     }
 
     #[inline]
-    async fn generate_key_pair() -> KeyPair {
-        task::spawn_blocking(|| rcgen::KeyPair::generate().unwrap())
+    async fn generate_key_pair() -> Result<KeyPair, ErrorResponse> {
+        task::spawn_blocking(rcgen::KeyPair::generate)
             .await
-            .unwrap()
+            .map_err(|err| {
+                ErrorResponse::new(
+                    ErrorResponseType::Internal,
+                    format!("Key pair generation did not complete: {err}"),
+                )
+            })?
+            .map_err(|err| cert_err("generate a key pair", err))
     }
 
     fn key_pair(&self) -> Result<KeyPair, ErrorResponse> {
         let dec = EncValue::try_from(self.key_pair.clone())?.decrypt()?;
         let s = String::from_utf8_lossy(dec.as_ref());
-        Ok(KeyPair::from_pem(s.as_ref()).unwrap())
+        KeyPair::from_pem(s.as_ref()).map_err(|err| cert_err("read the stored CA key", err))
     }
 
     fn params(nbf: OffsetDateTime, exp: OffsetDateTime) -> CertificateParams {

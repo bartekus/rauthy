@@ -8,13 +8,18 @@
 # which additionally needs to write a pull-request comment. No job references a registry token.
 name: release candidate
 
-# Only `push` to a release branch and a manual dispatch. A `pull_request` trigger would run the
-# whole matrix a second time on the same commit; a pull request onto a release line shows the
-# checks from the push run, because GitHub attaches them to the commit.
+# Only `push` to a release branch or a release line, and a manual dispatch. A `pull_request`
+# trigger would run the whole matrix a second time on the same commit; a pull request onto a
+# release line shows the checks from the push run, because GitHub attaches them to the commit.
+#
+# The release line is here because a merge produces a new commit. The publish workflow promotes
+# only a run whose commit is the one it publishes, so the run that qualifies a release is the one
+# on the merge commit, not the one on the branch that was merged.
 on:
   push:
     branches:
       - 'release/**'
+      - 'patched/**'
   workflow_dispatch:
 
 permissions: {}
@@ -28,6 +33,10 @@ env:
   RUST_VERSION: '1.95.0'
   BUILD_IMAGE: 'rust:1.95.0-bookworm'
   UPSTREAM_BASE_IMAGE: 'ghcr.io/sebadob/rauthy:0.36.2'
+  # The consumer whose own live suite runs against this candidate, at a pinned commit of its
+  # public repository. Bumped deliberately, never followed.
+  CONSUMER_REPO: 'statecrafting/rahi'
+  CONSUMER_REF: 'b815b18ce53e366e3771799652ede8e58e69e801'
 
 jobs:
   assets:
@@ -72,7 +81,7 @@ jobs:
         with:
           name: generated-assets
           path: generated-assets.tar.gz
-          retention-days: 7
+          retention-days: 30
 
   checks:
     name: style and unit checks
@@ -96,6 +105,40 @@ jobs:
       # The same gate upstream's `just is-clean` uses. `--all-targets` would additionally lint
       # upstream's own test code, which this release does not modify.
       - run: cargo clippy --workspace -- -D warnings
+
+  # What the build actually resolves, recorded and checked before anything is built from it. The
+  # shape is enforced here (one copy of each patched package, one openraft, no upstream package
+  # beside them); whether every package comes from the registry is recorded rather than enforced,
+  # so that a candidate against an unpublished dependency can still be exercised, and it is the
+  # publish workflow that refuses such a candidate.
+  graph:
+    name: dependency graph
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: The lock file is complete and the graph has the right shape
+        run: |
+          set -euo pipefail
+          # `--locked` fails if resolving the manifests would change the lock file.
+          cargo metadata --locked --format-version 1 > metadata.json
+          python3 assets/release/check_graph.py --structure Cargo.lock
+          echo "registry graph: $(python3 assets/release/check_graph.py --report Cargo.lock)"
+          python3 assets/release/check_graph.py --table Cargo.lock | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo tree --locked -i hiqlite-patched -e normal,build --depth 1 | tee hiqlite-tree.txt
+          cargo tree --locked --duplicates -e normal > duplicates.txt || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-graph
+          path: |
+            metadata.json
+            hiqlite-tree.txt
+            duplicates.txt
+          retention-days: 30
 
   tests:
     name: integration suite (${{ matrix.backend }})
@@ -197,7 +240,7 @@ jobs:
             -e CARGO_HOME=/work/.cargo-home \
             $jemalloc_env \
             rauthy-ci-builder \
-            bash -euxc 'cargo build --release --locked'
+            bash -euxc 'cargo build --release --locked && rustc -vV > rustc-version.txt'
           mv target/release/rauthy "rauthy_${{ matrix.arch }}"
           sha256sum "rauthy_${{ matrix.arch }}" > "rauthy_${{ matrix.arch }}.sha256"
 
@@ -207,7 +250,35 @@ jobs:
           file "rauthy_${{ matrix.arch }}"
           # The highest glibc symbol version the artifact requires: the floor a runtime must meet.
           objdump -T "rauthy_${{ matrix.arch }}" 2>/dev/null \
-            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -5 || true
+            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 > glibc-floor.txt || true
+          cat glibc-floor.txt
+
+      # What these bytes were built from, so that a publish run can check it against the tree it
+      # is asked to publish instead of trusting that the run id it was given is the right one.
+      - name: Write the candidate manifest
+        run: |
+          set -euo pipefail
+          mkdir -p manifest
+          ARCH="${{ matrix.arch }}" \
+          REGISTRY_GRAPH="$(python3 assets/release/check_graph.py --report Cargo.lock 2>/dev/null)" \
+          python3 - <<'PYEOF'
+          import hashlib, json, os
+          arch = os.environ["ARCH"]
+          sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+          json.dump({
+              "arch": arch,
+              "commit": os.environ["GITHUB_SHA"],
+              "ref": os.environ["GITHUB_REF"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "cargo_lock_sha256": sha("Cargo.lock"),
+              "registry_graph": os.environ["REGISTRY_GRAPH"].strip() == "true",
+              "build_image": os.environ["BUILD_IMAGE"],
+              "rustc": open("rustc-version.txt").read(),
+              "binary_sha256": sha(f"rauthy_{arch}"),
+              "glibc_floor": open("glibc-floor.txt").read().strip(),
+          }, open("manifest/candidate-manifest.json", "w"), indent=2)
+          PYEOF
+          cat manifest/candidate-manifest.json
 
       - uses: actions/upload-artifact@v4
         with:
@@ -215,7 +286,13 @@ jobs:
           path: |
             rauthy_${{ matrix.arch }}
             rauthy_${{ matrix.arch }}.sha256
-          retention-days: 7
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-manifest-${{ matrix.arch }}
+          path: manifest/candidate-manifest.json
+          retention-days: 30
 
   acceptance:
     name: acceptance (${{ matrix.arch }})
@@ -254,6 +331,9 @@ jobs:
         env:
           # Keep the run inside the workspace so its logs can be uploaded on failure.
           ACCEPTANCE_WORK: ${{ github.workspace }}/acceptance-work
+          # A skipped leg fails the run: a candidate that could not run a leg is not qualified
+          # for it, however the job's colour reads.
+          ACCEPTANCE_STRICT: '1'
         run: |
           set -euo pipefail
           mkdir -p "$ACCEPTANCE_WORK"
@@ -264,5 +344,130 @@ jobs:
         with:
           name: acceptance-${{ matrix.arch }}
           path: acceptance-work/**/*.log
-          retention-days: 7
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-result-${{ matrix.arch }}
+          path: acceptance-work/acceptance-result.json
+          retention-days: 30
+
+  # The consumer's own live suite, run against this candidate the way the consumer runs it
+  # against the release it pins: an image built from these bytes, a container on a fixed origin,
+  # the binary taken out of that image, and RAHI_REQUIRE_RAUTHY=1 so that no gated test can skip.
+  # It is checked out from the consumer's public repository at a pinned commit into this job's
+  # workspace; nothing is written back to it.
+  consumer:
+    name: consumer (rahi live suite)
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+    env:
+      LIVE_ORIGIN: http://localhost:8080
+      LIVE_REG_TOKEN: rahi-live-registration-token
+      LIVE_API_KEY_NAME: rahi
+      LIVE_API_KEY_SECRET: RahiLiveApiKeySecret0123456789abcdefghijklmnopqrstuvwxyz0123456789
+      LIVE_ADMIN: admin@localhost
+      LIVE_ADMIN_PASSWORD: RahiLiveAdminPassword123!
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CONSUMER_REPO }}
+          ref: ${{ env.CONSUMER_REF }}
+          path: consumer
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: rauthy-amd64
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: consumer
+
+      - name: Build the image from the candidate bytes
+        run: |
+          set -euxo pipefail
+          sha256sum -c rauthy_amd64.sha256
+          mkdir -p out/empty
+          cp rauthy_amd64 out/rauthy_amd64
+          chmod +x out/rauthy_amd64
+          docker build --platform linux/amd64 --build-arg VERSION=candidate \
+            -t rauthy-candidate:local .
+          id="$(docker create rauthy-candidate:local)"
+          mkdir -p "$RUNNER_TEMP/rauthy"
+          docker cp "$id:/app/rauthy" "$RUNNER_TEMP/rauthy/rauthy"
+          docker rm "$id" > /dev/null
+          cmp "$RUNNER_TEMP/rauthy/rauthy" rauthy_amd64
+          "$RUNNER_TEMP/rauthy/rauthy" --version
+          echo "RAHI_TEST_RAUTHY=$RUNNER_TEMP/rauthy/rauthy" >> "$GITHUB_ENV"
+
+      # The same environment the consumer's `live.yml` gives the release it pins.
+      - name: Start the candidate on the live origin
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/rauthy.env" <<ENV
+          PUB_URL=localhost:8080
+          LISTEN_SCHEME=http
+          LISTEN_ADDRESS=0.0.0.0
+          LISTEN_PORT_HTTP=8080
+          COOKIE_MODE=danger-insecure
+          RP_ID=localhost
+          RP_ORIGIN=${LIVE_ORIGIN}
+          RP_NAME=rahi-live
+          HQL_NODE_ID=1
+          HQL_NODES=1 127.0.0.1:8100 127.0.0.1:8200
+          HQL_LISTEN_ADDR_API=127.0.0.1
+          HQL_LISTEN_ADDR_RAFT=127.0.0.1
+          HQL_SECRET_RAFT=RahiLiveRaftSecret0123456789abcdefghijklmnopqrstuvwxyz0123456789
+          HQL_SECRET_API=RahiLiveApiClusterSecret0123456789abcdefghijklmnopqrstuvwxyz0123456789
+          ENC_KEYS=live/9/KslT9sVWd0aEnR9e0AVrd4aTue/etZIqCm4PsjsnU=
+          ENC_KEY_ACTIVE=live
+          ENABLE_DYN_CLIENT_REG=true
+          DYN_CLIENT_REG_TOKEN=${LIVE_REG_TOKEN}
+          DYN_CLIENT_RATE_LIMIT_SEC=0
+          BOOTSTRAP_ADMIN_EMAIL=${LIVE_ADMIN}
+          BOOTSTRAP_ADMIN_PASSWORD_PLAIN=${LIVE_ADMIN_PASSWORD}
+          BOOTSTRAP_API_KEY_SECRET=${LIVE_API_KEY_SECRET}
+          ENV
+          key='{"name":"'"$LIVE_API_KEY_NAME"'","exp":1924991999,"access":[{"group":"Blacklist","access_rights":["read","create","update","delete"]},{"group":"Clients","access_rights":["read","create","update","delete"]},{"group":"Users","access_rights":["read","create","update","delete"]},{"group":"Roles","access_rights":["read","create","update","delete"]},{"group":"Scopes","access_rights":["read","create","update","delete"]}]}'
+          echo "BOOTSTRAP_API_KEY=$(printf '%s' "$key" | base64 -w0)" >> "$RUNNER_TEMP/rauthy.env"
+          : > "$RUNNER_TEMP/config.toml"
+          docker run -d --name rauthy-live -p 8080:8080 \
+            --env-file "$RUNNER_TEMP/rauthy.env" \
+            -v "$RUNNER_TEMP/config.toml:/app/config.toml:ro" \
+            rauthy-candidate:local
+          for _ in $(seq 1 120); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' "$LIVE_ORIGIN/auth/v1/health")" = "200" ]; then
+              echo "rauthy is healthy"; exit 0
+            fi
+            sleep 1
+          done
+          docker logs rauthy-live >&2
+          exit 1
+
+      - name: The consumer's whole suite, with rauthy and no skips allowed
+        working-directory: consumer
+        env:
+          RAHI_REQUIRE_RAUTHY: '1'
+          RAHI_TEST_RAUTHY_URL: ${{ env.LIVE_ORIGIN }}
+          RAHI_TEST_RAUTHY_REG_TOKEN: ${{ env.LIVE_REG_TOKEN }}
+          RAHI_TEST_RAUTHY_API_KEY: ${{ env.LIVE_API_KEY_NAME }}$${{ env.LIVE_API_KEY_SECRET }}
+          RAHI_TEST_RAUTHY_USER: ${{ env.LIVE_ADMIN }}
+          RAHI_TEST_RAUTHY_PASSWORD: ${{ env.LIVE_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          rustup show
+          cargo test --workspace --locked --no-fail-fast -- --test-threads=2
+
+      - name: rauthy's log
+        if: always()
+        run: docker logs rauthy-live > rauthy-live.log 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: consumer-rauthy-log
+          path: rauthy-live.log
+          retention-days: 30
           if-no-files-found: ignore

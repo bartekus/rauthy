@@ -189,17 +189,16 @@ impl DB {
             } else if let Some(root_ca) = &vars.pg_tls_root_ca {
                 let mut root_store = rustls::RootCertStore::empty();
 
+                // This runs inside `DB::init()` after the Hiqlite node has started, so an unusable
+                // certificate is an error for it to act on, not a panic that skips the shutdown.
+                let invalid = |msg: String| ErrorResponse::new(ErrorResponseType::Internal, msg);
                 for res in CertificateDer::pem_slice_iter(root_ca.as_bytes()) {
-                    match res {
-                        Ok(cert) => {
-                            root_store
-                                .add(cert)
-                                .expect("Invalid `database.pg_tls_root_ca`");
-                        }
-                        Err(err) => {
-                            panic!("Cannot parse `database.pg_tls_root_ca`: {err:?}")
-                        }
-                    }
+                    let cert = res.map_err(|err| {
+                        invalid(format!("Cannot parse `database.pg_tls_root_ca`: {err:?}"))
+                    })?;
+                    root_store.add(cert).map_err(|err| {
+                        invalid(format!("Invalid `database.pg_tls_root_ca`: {err}"))
+                    })?;
                 }
 
                 rustls::ClientConfig::builder()

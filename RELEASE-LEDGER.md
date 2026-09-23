@@ -509,8 +509,11 @@ that test. The test now asserts a patch level of at least `1`. The candidate's s
 passed because it does not run that crate's unit tests; the whole workspace's unit tests were run
 locally before the fix was pushed.
 
-The final head gets its own review round before merge; the publish gate requires every review run
-on that exact head to be a successful first attempt.
+**Round 15** (review run `35829280152`, head `7bb17935`, PR #4): `VERDICT: no blocking findings`,
+the only review run on that head. PR #4 merged as `17132b94`, which is the published tag.
+
+**Round 16** (review run `35842113862`, PR #5, docs only): `VERDICT: no blocking findings`; its one
+note was that this section had no entry for round 15, which is the paragraph above.
 
 ## 10. Upstream return path and maintenance
 

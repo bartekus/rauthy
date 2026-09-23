@@ -672,6 +672,43 @@ assert "the failed generation shut the storage layer down cleanly" $? \
   "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$O/rauthy.log" | head -3)"
 stop_node "$O"
 
+# --- S: the mail sender is an exit path too ----------------------------------
+
+log "S. A mail configuration that cannot work fails cleanly"
+# The sender connects to SMTP after the storage layer is live. Upstream v0.36.2 `expect()`s an
+# incomplete configuration there (exit 134, and the next start rebuilds the state machine), and
+# `panic!`s once its connection retries are exhausted (exit 134 after the storage shutdown).
+
+# mail_exit_case <name> <dir> <log-pattern> [env...]
+mail_exit_case() {
+  local name="$1" dir="$2" pattern="$3"; shift 3
+  mkdir -p "$dir"
+  run_until_exit "$dir" 8092 8122 8222 300 SMTP_CONNECT_RETRIES=0 "$@"
+  local rc=$?
+  [ "$rc" -eq 1 ]
+  assert "$name fails the start with exit 1" $? "exit code was $rc"
+  grep -q "$pattern" "$dir/rauthy.log"
+  assert "the failure names $name" $? "$(tail -3 "$dir/rauthy.log")"
+  mv "$dir/rauthy.log" "$dir/mail-failure.log"
+  start_node "$dir" 8092 8122 8222
+  wait_ready "$dir" 8092 300
+  assert "the node starts without the mail configuration after $name" $? "see $dir/rauthy.log"
+  [ "$(unclean_markers "$dir")" = "0" ]
+  assert "$name shut the storage layer down cleanly" $? \
+    "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$dir/rauthy.log" | head -3)"
+  stop_node "$dir"
+}
+
+mail_exit_case "an SMTP_URL without SMTP_USERNAME" "$WORK/s1-smtp-no-user" \
+  'SMTP_USERNAME is not set' SMTP_URL=127.0.0.1
+# Nothing listens on port 1, so every attempt is refused at once.
+mail_exit_case "an SMTP relay that cannot be reached" "$WORK/s2-smtp-unreachable" \
+  'SMTP connection retries exceeded' SMTP_URL=127.0.0.1 SMTP_PORT=1 SMTP_USERNAME=user \
+  SMTP_PASSWORD=password
+mail_exit_case "an SMTP_FROM that is not a mailbox" "$WORK/s3-smtp-bad-from" \
+  'SMTP_FROM could not be parsed' SMTP_URL=127.0.0.1 SMTP_PORT=1 SMTP_USERNAME=user \
+  SMTP_PASSWORD=password "SMTP_FROM=not a mailbox"
+
 # --- L: the metrics listener is an exit path too ------------------------------
 
 log "L. A metrics listener that cannot start fails cleanly"

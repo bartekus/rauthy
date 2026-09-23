@@ -22,7 +22,7 @@ on:
         description: 'Run id of the release-candidate workflow whose artifacts to promote'
         required: true
       version:
-        description: 'The version to publish, e.g. 0.36.2-patched.1. Must match Cargo.toml.'
+        description: 'The version to publish, e.g. 0.36.2-patched.2. Must match Cargo.toml.'
         required: true
 
 permissions: {}
@@ -87,8 +87,11 @@ jobs:
       - name: Every Hiqlite package must come from a registry
         run: |
           set -euo pipefail
-          if grep -q '^\[patch\.crates-io\]' Cargo.toml && \
-             grep -A5 '^\[patch\.crates-io\]' Cargo.toml | grep -qE '^\s*hiqlite'; then
+          # No `| grep -q` under pipefail anywhere in this workflow: `grep -q` exits at its first
+          # match, the writer can take SIGPIPE, and the pipeline then fails with 141. Inside an
+          # `if` that would read as "no match" and let this guard pass.
+          patch_section="$(grep -A5 '^\[patch\.crates-io\]' Cargo.toml || true)"
+          if grep -qE '^\s*hiqlite' <<< "$patch_section"; then
             echo "Cargo.toml still carries an active [patch.crates-io] entry for hiqlite" >&2
             exit 1
           fi
@@ -442,11 +445,15 @@ jobs:
           done
           docker logs smoke > smoke.log 2>&1 || true
           [ "$ok" = 1 ] || { cat smoke.log; echo "the image did not become ready" >&2; exit 1; }
-          curl -s http://localhost:8080/auth/v1/health | grep -q '"db_healthy":true'
+          curl -s http://localhost:8080/auth/v1/health > health.json
+          grep -q '"db_healthy":true' health.json
           grep -q "Downstream distribution by" smoke.log
           docker stop -t 60 smoke > /dev/null
           [ "$(docker inspect smoke --format '{{.State.ExitCode}}')" = "0" ]
-          docker logs smoke 2>&1 | grep -q "Shutdown complete"
+          # Into a file first: the first "Shutdown complete" is not the last line, and
+          # `docker logs | grep -q` failed run 35824160347 on arm64 with SIGPIPE (141).
+          docker logs smoke > smoke-final.log 2>&1
+          grep -q "Shutdown complete" smoke-final.log
           docker rm smoke > /dev/null
           echo "${{ matrix.arch }}: pulled by digest, tested bytes, starts, ready, clean shutdown"
 

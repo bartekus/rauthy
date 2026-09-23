@@ -1,4 +1,4 @@
-# Consumer handoff: Rauthy 0.36.2-patched.1
+# Consumer handoff: Rauthy 0.36.2-patched.2
 
 For the session that adopts this build in `rahi`. The evidence is in `RELEASE-LEDGER.md`; this file
 is what a consumer needs to act.
@@ -8,6 +8,10 @@ is what a consumer needs to act.
 > final except those values: the image digests, the binary checksums and the run links. The copy
 > on `patched/0.36.2` records them once the release exists.
 
+> **Never pin `0.36.2-patched.1`.** An image with that tag exists in the registry from a publish
+> run whose arm64 verification failed on a harness defect; it was never released and has no
+> provenance. The ledger's section 7 has the account.
+
 ## What this is
 
 A downstream patched build of upstream Rauthy `v0.36.2`, the release `rahi` already runs, on the
@@ -16,11 +20,11 @@ supported by the upstream project, and carries upstream's licence and authorship
 
 | | |
 |---|---|
-| Version | `0.36.2-patched.1` |
+| Version | `0.36.2-patched.2` |
 | Upstream base | `v0.36.2` = `dd61ac3c84d6b238108dc8438b53043b5177a662` |
 | Source | https://github.com/bartekus/rauthy, release line `patched/0.36.2` |
-| Tag | `v0.36.2-patched.1` (created by the publish run) |
-| Image | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.1` |
+| Tag | `v0.36.2-patched.2` (created by the publish run) |
+| Image | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.2` |
 | Binary path in image | `/app/rauthy`, executable named `rauthy`, `LICENSE` beside it |
 | Supported topology | N = 1 |
 
@@ -46,14 +50,14 @@ ARG RAUTHY_IMAGE=ghcr.io/sebadob/rauthy:0.36.2@sha256:f7d3c501402165e023edbd958b
 become, with the index digest from `RELEASE-PROVENANCE.md`:
 
 ```dockerfile
-ARG RAUTHY_IMAGE=ghcr.io/bartekus/rauthy-patched:0.36.2-patched.1@sha256:<index-digest>
+ARG RAUTHY_IMAGE=ghcr.io/bartekus/rauthy-patched:0.36.2-patched.2@sha256:<index-digest>
 ```
 
 Update the comment above the line in `docker/Dockerfile` ("rauthy 0.36.2, pinned by the digest of
 its multi-architecture index") to name the patched build and its upstream base.
 
 Unchanged: `RAHI_RAUTHY_BIN` stays `/usr/local/bin/rauthy`, the `COPY --from=rauthy /app/rauthy`
-line stays, and `rauthy --version` prints a parseable SemVer (`rauthy 0.36.2-patched.1`).
+line stays, and `rauthy --version` prints a parseable SemVer (`rauthy 0.36.2-patched.2`).
 
 ## The one required operational change: the first start after the upgrade
 
@@ -82,7 +86,7 @@ value other than `true`/`false` is a startup error.
 
 Otherwise nothing: no schema change, no migration, no renamed, removed or newly required value. A
 config file that cannot be read now fails the start, except an absent default `./config.toml`, so
-an environment-only deployment is unaffected. The build stamps `0.36.2-patched.1` into the
+an environment-only deployment is unaffected. The build stamps `0.36.2-patched.2` into the
 `config` table's `db_version` row.
 
 ## Caller-visible behaviour changes

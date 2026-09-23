@@ -1,4 +1,4 @@
-# Release ledger: Rauthy 0.36.2-patched.1
+# Release ledger: Rauthy 0.36.2-patched.2
 
 A downstream patched distribution of Rauthy. **Not an upstream release**, not endorsed by and not
 supported by the upstream project. Upstream's sources, licence and authorship are carried
@@ -13,20 +13,20 @@ release's `RELEASE-PROVENANCE.md`, and the ledger on `patched/0.36.2` records th
 
 | | |
 |---|---|
-| Version | `0.36.2-patched.1` (no release or tag of this version has ever been published, so the number is not reused) |
+| Version | `0.36.2-patched.2`. `patched.1` is burnt: see "The `0.36.2-patched.2` image" in section 7 |
 | Upstream base | `v0.36.2` = `dd61ac3c84d6b238108dc8438b53043b5177a662` |
 | Source | https://github.com/bartekus/rauthy, work branch `release/0.36.2-patched.1-hiqlite` |
 | Release line | `patched/0.36.2` (first merge: PR #2 at `119131b2`, against upstream `hiqlite 0.14.0`) |
-| Image | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.1` |
+| Image | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.2` |
 | Binary path in image | `/app/rauthy` (unchanged) |
 | Executable name | `rauthy` (unchanged) |
 | Storage dependency | `hiqlite-patched`, `hiqlite-wal-patched`, `hiqlite-derive-patched` `0.15.0-patched.1` |
 | Supported topology | N = 1 |
-| Publication status | the dependency is published and resolved from crates.io; publication follows the merge of PR #3. Section 7 |
+| Publication status | section 7 |
 
-`patched.1` sits in the SemVer pre-release field because that is the only field a valid SemVer can
+`patched.N` sits in the SemVer pre-release field because that is the only field a valid SemVer can
 carry it in and still parse, order and satisfy rauthy's own `semver` checks. The consequence is
-that `0.36.2-patched.1` orders *below* `0.36.2`; section 5 records what that does and does not
+that `0.36.2-patched.2` orders *below* `0.36.2`; section 5 records what that does and does not
 affect. An OCI tag cannot contain `+`, so build metadata was not an option.
 
 **What changed since PR #2.** PR #2 qualified the repairs against upstream `hiqlite 0.14.0`,
@@ -100,6 +100,11 @@ row says otherwise.
 - **The acceptance harness let its defaults override a scenario's environment.** `start_node`
   passed the caller's assignments to `env` before its own, so a scenario could not set `PUB_URL`.
   No existing leg set a conflicting variable; M3 needed to.
+
+- **The publish verification failed on a pipe, not on the image** (section 7): `docker logs |
+  grep -q` under `pipefail` exited 141 on arm64 and stopped the `patched.1` publication after its
+  image was pushed. Every `| grep -q` in the publish workflow and the two negated ones in the
+  harness now read a file or a here-string.
 
 Downstream identity, not a defect fix: the version marker, the startup log line naming distributor
 and upstream base, the `patched.N` marker being recognised instead of warned about as an upstream
@@ -211,7 +216,7 @@ is for. The `ErrorResponse` type is unchanged.
 **Configuration.** No renames, no removals, no new required values. A config file that cannot be
 read now fails the start unless it is the default `./config.toml` and simply absent.
 
-**Database.** No schema change and no migration. This build stamps `0.36.2-patched.1` into the
+**Database.** No schema change and no migration. This build stamps `0.36.2-patched.2` into the
 `config` table's `db_version` row.
 
 **Upgrade from upstream v0.36.2, in place.**
@@ -319,32 +324,64 @@ The qualifying run is the one section 7 names, on the merge commit, against the 
 
 ## 7. Publication status
 
-**Ready to publish once PR #3 merges.** Nothing outside this repository remains: the patched
-Hiqlite packages are on crates.io (section 4) and this tree resolves them with no path, git or
-`[patch]` source.
+**`0.36.2-patched.2` is the version to publish.** Nothing outside this repository blocks it: the
+patched Hiqlite packages are on crates.io (section 4), and this tree resolves them with no path,
+git or `[patch]` source.
 
-The sequence, each step a precondition of the next:
+### The `0.36.2-patched.1` image: pushed, verified on amd64 only, never released
 
-1. `check_graph.py Cargo.lock` passes as a release graph (done; section 4).
-2. The candidate workflow is green on the pull request's final head, and the independent review
-   of that exact head ends `VERDICT: no blocking findings` on its first attempt (section 9).
-3. PR #3 is merged into `patched/0.36.2`.
-4. The candidate workflow runs **on the merge commit**. That run, first attempt, strict, is the
-   only one the publish gate accepts; its binaries are the bytes that ship.
-5. `release-publish.yaml` is dispatched from `patched/0.36.2` with that run's id. It pushes the
-   image, verifies it on both architectures, then creates the tag and the release.
-6. If the GHCR package is private after the first push, making it public is an owner action no
-   workflow token can perform:
-   https://github.com/users/bartekus/packages/container/rauthy-patched/settings -> Change package
-   visibility -> Public. The publish run checks anonymously and reports it.
+PR #3 merged as `60e0f28b`. Its candidate run `35819848674` was green on the first attempt
+(acceptance 153 passed, 0 failed, 0 skipped, strict, on amd64 and arm64; both integration suites;
+Rahi 606 passed, 0 failed). Publish run `35824160347` promoted it: the gate passed, the image job
+pushed `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.1` at index digest
+`sha256:4260d9eb649ec59cb299143b8e87228ded78b77bd1518b2fc8f0fe9a5ee482dc` and attested it, amd64
+verification passed, and **arm64 verification failed with exit 141**. The release job therefore
+did not run: no git tag and no GitHub release exist for `patched.1`.
 
-The values that only a publish run can produce (tag, image index and platform digests, binary
-checksums, run links) are in the release's `RELEASE-PROVENANCE.md`, and are recorded on
-`patched/0.36.2` afterwards, without moving the tag.
+The failure was the harness, not the image. `docker logs smoke 2>&1 | grep -q "Shutdown complete"`
+ran under `pipefail`; the first of three "Shutdown complete" lines is line 164 of 178, so `grep -q`
+exited while `docker logs` was still writing, and the pipeline failed with SIGPIPE. Reproduced
+outside CI on linux/arm64 from an anonymous pull of that digest: the binary hashes to the tested
+arm64 binary (`b384ba53...`), `--version` prints `rauthy 0.36.2-patched.1`, `/ready` answered `200`
+after 10 s, `/health` reported both layers healthy, and the container stopped with exit `0`.
+
+Why a new version and not a rerun: re-running a failed job until it passes is the green-by-rerun
+this release refuses for candidates and reviews, and a fresh publish of `patched.1` is refused by
+the gate because the image tag already exists. Published tags never move, so `patched.1` is
+burnt. **Do not pin `0.36.2-patched.1`**: it has no release, no provenance file, and its arm64
+verification never passed in the workflow. It is left in the registry rather than deleted, so
+that nothing that may have pulled it finds it gone.
+
+### Also found by that attempt
+
+- `workflow_dispatch` resolves the workflow on the default branch, which is `main` and carries
+  upstream's tree, so `release-publish.yaml` could not be dispatched by name. GitHub assigns a
+  workflow id the first time any event runs a workflow; one run on a throwaway branch whose copy
+  also listened to a push there, with every job skipped, registered it (run `35824125018`, id
+  `364850805`). The branch was deleted. The publish run is dispatched by that id with
+  `ref=patched/0.36.2`, so it runs the file as merged there. `main` is unchanged.
+- The same `| grep -q` shape appeared in the `[patch.crates-io]` guard, where a SIGPIPE inside the
+  `if` would have read as "no entry" and let the guard pass, and in two negated acceptance
+  assertions in leg P, where it would have read as "not leaked". All are file or here-string reads
+  now.
+
+### The sequence for `patched.2`
+
+1. `check_graph.py Cargo.lock` passes as a release graph (section 4).
+2. The candidate is green on the pull request's head, and every review run on that head is a
+   first-attempt `pull_request` run ending `VERDICT: no blocking findings`.
+3. The pull request is merged into `patched/0.36.2`, and the candidate runs on the merge commit.
+   That run is the only one the publish gate accepts; its binaries are the bytes that ship.
+4. `release-publish.yaml` is dispatched by id `364850805` with `ref=patched/0.36.2`.
+5. The package is already anonymously pullable (checked against the registry for the `patched.1`
+   digest), so no owner visibility action is expected.
+
+The values only a publish run produces (tag, image index and platform digests, binary checksums,
+run links) are in the release's `RELEASE-PROVENANCE.md`, and are recorded on `patched/0.36.2`
+afterwards without moving the tag.
 
 `.cargo/config.toml` sets `global-min-publish-age = '10 days'` under `[unstable]`; only nightly
-cargo honours it, and this release builds on stable `1.95.0`, so a freshly published package is
-not blocked.
+cargo honours it, and this release builds on stable `1.95.0`.
 
 ## 8. Publication design
 
@@ -432,6 +469,16 @@ to have closed. Reproduced in both forms and fixed as F17. Because rounds 8, 11 
 another panic site of the same class, the next step was a sweep of every operator-reachable panic
 after `DB::init()`, not a third one-site fix. It listed about 25; F18 refuses the ones validation
 can decide, and F19 is the safety net for the rest (section 3.5 states its limit).
+
+**Round 13** (review run `35815196727`, head `e428b322`): `VERDICT: no blocking findings`. PR #3
+merged as `60e0f28b`; section 7 records its publication attempt.
+
+**Round 14** (review run `35824500935`, head `d3c57554`, PR #4): `VERDICT: blocking findings`, one,
+real. The version bump to `patched.2` broke a unit test that asserted the patch level was the
+literal `1`; the same head's candidate run `35824497305` failed its integration jobs on exactly
+that test. The test now asserts a patch level of at least `1`. The candidate's style job had
+passed because it does not run that crate's unit tests; the whole workspace's unit tests were run
+locally before the fix was pushed.
 
 The final head gets its own review round before merge; the publish gate requires every review run
 on that exact head to be a successful first attempt.

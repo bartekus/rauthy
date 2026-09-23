@@ -219,9 +219,9 @@ mod tests {
     fn the_shipped_version_parses_and_is_recognised_as_a_downstream_build() {
         let v = DbVersion::app_version();
         assert_eq!((v.major, v.minor), (0, 36), "the guard below keys on this");
-        assert_eq!(
-            downstream_patch_level(&v),
-            Some(1),
+        // Any patch level: a literal here breaks on every version bump (it did for patched.2).
+        assert!(
+            downstream_patch_level(&v).is_some_and(|n| n >= 1),
             "RAUTHY_VERSION {RAUTHY_VERSION} must carry the downstream marker, or the release \
             would log an upstream pre-release warning"
         );

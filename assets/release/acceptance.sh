@@ -683,15 +683,15 @@ log "S. A mail configuration that cannot work fails cleanly"
 mail_exit_case() {
   local name="$1" dir="$2" pattern="$3"; shift 3
   mkdir -p "$dir"
-  run_until_exit "$dir" 8092 8122 8222 300 SMTP_CONNECT_RETRIES=0 "$@"
+  run_until_exit "$dir" 8093 8123 8223 300 SMTP_CONNECT_RETRIES=0 "$@"
   local rc=$?
   [ "$rc" -eq 1 ]
   assert "$name fails the start with exit 1" $? "exit code was $rc"
   grep -q "$pattern" "$dir/rauthy.log"
   assert "the failure names $name" $? "$(tail -3 "$dir/rauthy.log")"
   mv "$dir/rauthy.log" "$dir/mail-failure.log"
-  start_node "$dir" 8092 8122 8222
-  wait_ready "$dir" 8092 300
+  start_node "$dir" 8093 8123 8223
+  wait_ready "$dir" 8093 300
   assert "the node starts without the mail configuration after $name" $? "see $dir/rauthy.log"
   [ "$(unclean_markers "$dir")" = "0" ]
   assert "$name shut the storage layer down cleanly" $? \

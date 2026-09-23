@@ -22,7 +22,7 @@ release's `RELEASE-PROVENANCE.md`, and the ledger on `patched/0.36.2` records th
 | Executable name | `rauthy` (unchanged) |
 | Storage dependency | `hiqlite-patched`, `hiqlite-wal-patched`, `hiqlite-derive-patched` `0.15.0-patched.1` |
 | Supported topology | N = 1 |
-| Publication status | section 7 |
+| Publication status | **published 2026-09-23**: release `v0.36.2-patched.2`, image index `sha256:ea114a8b...`. Section 7 |
 
 `patched.N` sits in the SemVer pre-release field because that is the only field a valid SemVer can
 carry it in and still parse, order and satisfy rauthy's own `semver` checks. The consequence is
@@ -324,9 +324,49 @@ The qualifying run is the one section 7 names, on the merge commit, against the 
 
 ## 7. Publication status
 
-**`0.36.2-patched.2` is the version to publish.** Nothing outside this repository blocks it: the
-patched Hiqlite packages are on crates.io (section 4), and this tree resolves them with no path,
-git or `[patch]` source.
+**Published 2026-09-23.** Every value below was read back from GitHub and the registry after the
+publish run, not copied from the run's own output. The copy of this file attached to the release
+is the one from the tagged tree, written before these values existed; this section on
+`patched/0.36.2` is where they are recorded, and the tag does not move.
+
+| | |
+|---|---|
+| Release | https://github.com/bartekus/rauthy/releases/tag/v0.36.2-patched.2 |
+| Tag | `v0.36.2-patched.2` -> `17132b9451912cf45d33c99990f21678b75e2e26` (the merge of PR #4) |
+| Reviewed head | PR #4 at `7bb179350ebf4ece44a3be64b9b7ef6bb9127954`, same tree as the tag |
+| Upstream base | `v0.36.2` = `dd61ac3c84d6b238108dc8438b53043b5177a662` |
+| Image, pinned | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.2@sha256:ea114a8bb743d578dea6d7800916ee43550939c749a2cf586f9abdc0d0c52478` |
+| `linux/amd64` manifest | `sha256:6774d28c9f611777dc4ad2243a8f4cb1fa0df3d94caca1aeaf052cc10d9e5658` |
+| `linux/arm64` manifest | `sha256:6ae9225a9243a7e660f6c407d07f81258d06f456470dfb4b6c899a6db13146f8` |
+| `rauthy_amd64` sha256 | `742b18ba3717a92577a2ae0d517546a64ef6967c86e2847b50b10a22ab8dfc59` |
+| `rauthy_arm64` sha256 | `5e498c31ef23ebc27a6d2dbdbf73f6d6f48129f541fced92d48a53b87d61e312` |
+| `Cargo.lock` sha256 | `923af1dcfe6181632ee79cf49082a6881bf0f20aed7a8c79b205762bcf7233c0` |
+| Toolchain | `rust:1.95.0-bookworm`, `rustc 1.95.0 (59807616e 2026-04-14)`; glibc floor `GLIBC_2.34` |
+| Candidate run (merge commit) | https://github.com/bartekus/rauthy/actions/runs/35835459954 |
+| Candidate run (reviewed head) | https://github.com/bartekus/rauthy/actions/runs/35829275274 |
+| Review run (round 15) | https://github.com/bartekus/rauthy/actions/runs/35829280152 |
+| Publish run | https://github.com/bartekus/rauthy/actions/runs/35841596479 |
+
+**What each run established.** The merge-commit candidate: first attempt, all 10 jobs green,
+acceptance 153 passed, 0 failed, 0 skipped, strict, natively on amd64 and on arm64; both integration
+suites (Hiqlite, Postgres); Rahi's live suite 606 passed, 0 failed, 1 ignored by Rahi. The publish
+run, first attempt, every job green: the gate accepted that run, the image job pushed and attested
+the index, native verification on each architecture pulled by digest, compared the binary byte
+for byte with the tested one, checked labels and licence, reached `/ready` and shut down with exit
+`0`, and only then the release was created with 8 assets.
+
+**Checked independently afterwards,** from a Docker configuration with no credentials: the tag
+`0.36.2-patched.2` resolves to the index digest above; the index lists exactly the two platform
+manifests above plus their two attestation manifests; each platform's `/app/rauthy` hashes to the
+release asset of the same name, which `SHA256SUMS` lists; `--version` prints
+`rauthy 0.36.2-patched.2` on both; the labels name the fork as source, `Apache-2.0`, the upstream
+base and commit, and the revision `17132b94`; `/app/LICENSE` is upstream's. Started from the image
+with an empty config file and environment only: ready in 11 s on arm64 (native) and 15 s on amd64
+(emulated on this host; the workflow ran it natively), both layers healthy, the downstream banner
+logged, exit `0` on `docker stop`, no panic. The release assets download without authentication.
+
+**Anonymous access:** the package is public; the registry serves the index to an anonymous pull
+token. No owner action remains.
 
 ### The `0.36.2-patched.1` image: pushed, verified on amd64 only, never released
 
@@ -365,23 +405,12 @@ that nothing that may have pulled it finds it gone.
   assertions in leg P, where it would have read as "not leaked". All are file or here-string reads
   now.
 
-### The sequence for `patched.2`
+### How the publish run is dispatched
 
-1. `check_graph.py Cargo.lock` passes as a release graph (section 4).
-2. The candidate is green on the pull request's head, and every review run on that head is a
-   first-attempt `pull_request` run ending `VERDICT: no blocking findings`.
-3. The pull request is merged into `patched/0.36.2`, and the candidate runs on the merge commit.
-   That run is the only one the publish gate accepts; its binaries are the bytes that ship.
-4. `release-publish.yaml` is dispatched by id `364850805` with `ref=patched/0.36.2`.
-5. The package is already anonymously pullable (checked against the registry for the `patched.1`
-   digest), so no owner visibility action is expected.
-
-The values only a publish run produces (tag, image index and platform digests, binary checksums,
-run links) are in the release's `RELEASE-PROVENANCE.md`, and are recorded on `patched/0.36.2`
-afterwards without moving the tag.
-
-`.cargo/config.toml` sets `global-min-publish-age = '10 days'` under `[unstable]`; only nightly
-cargo honours it, and this release builds on stable `1.95.0`.
+`release-publish.yaml` is dispatched by workflow id `364850805` with `ref=patched/<line>`, because
+dispatch by name resolves on the default branch. A later patch level follows the same sequence:
+release graph, green candidate and clean first-attempt review on the pull request's head, merge,
+candidate on the merge commit, dispatch with that run's id.
 
 ## 8. Publication design
 

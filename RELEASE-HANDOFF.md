@@ -41,15 +41,25 @@ Until a Rauthy built on a repaired Hiqlite is released and qualified, the first 
 variable requires, as the operator's precondition:
 
 1. the upstream container stopped **and removed**, so that no restart policy can bring it back;
-2. no process holding `<data_dir>/logs/lock.hql` or `<data_dir>/logs_cache/lock.hql` (for example
-   `fuser` or `lsof` on both, from the host or a debug container on the volume);
+2. no process holding `<data_dir>/logs/lock.hql` or `<data_dir>/logs_cache/lock.hql`. `fuser`
+   or `lsof` see only their own PID namespace, so run them on the host or in a container started
+   with `--pid=host`; from a container on the volume they read "free" while another container
+   holds the lock. Alternatively test the lock itself: advisory locks are per inode in one
+   kernel, so a non-blocking `flock` on the file from any container on the same host is
+   authoritative. Check that the file exists first, because `flock(1)` creates a missing file and
+   the next start reads a `lock.hql` it did not expect as an unclean stop. The check is momentary;
+   steps 1 and 3 keep it true;
 3. exactly one start with the variable, from a supervisor that cannot start the old image on the
-   same volume at the same time.
+   same volume at the same time, and the variable removed after that start's first `/ready`.
+   Left in the environment, it authorizes every later start to move a legacy cache it finds
+   (a restored or re-created upstream directory, an old container brought back) without an
+   operator's decision, which re-arms this hazard and C-5's.
 
 Two patched processes still exclude each other before anything is touched, as stated below.
 
-**C-3. A refusal is not side-effect free.** The legacy-cache refusal ends "Nothing was changed.",
-but the start that refuses has already created `<data_dir>/hiqlite-owner.lock` (and the data
+**C-3. A refusal is not side-effect free.** This concerns a start **without** the variable; with
+it and a live upstream node the published build moves the cache first (C-2). The legacy-cache
+refusal ends "Nothing was changed.", but the start that refuses has already created `<data_dir>/hiqlite-owner.lock` (and the data
 directory, if it was absent). That is the only addition Rahi (043 D-P2) and Hiqlite (035 P-1)
 observed on the published build; no data file is moved or written. The ledger's section 5 note
 about a checkpointed database file was measured on an earlier Hiqlite tree, in which the check
@@ -71,9 +81,12 @@ the operator has to re-apply it.
 files in `logs_cache`. A crash between the two renames can leave a `0.14` cache snapshot that the
 next start restores without refusing and without consent (Hiqlite F-130: a defect, confidence
 medium, read from source, not reproduced). The repair is Hiqlite spec 035 B-5, which is not
-released; a Rauthy rebuilt on it is required before this path is qualified. Until then: if the
-first start with the variable does not reach `/ready`, do not start it again. Restore the
-pre-upgrade archive into a fresh volume (C-4) and repeat the upgrade.
+released; a Rauthy rebuilt on it is required before this path is qualified. The dangerous step
+is **any** next start on the volume, with or without the variable: without it, the published
+build opens the `0.14` snapshot. Until then: if the first start with the variable ends (crash,
+kill, out of memory, power loss) before `<data_dir>/logs_cache/hiqlite-cache-log-format`
+exists, start nothing on the volume; restore the pre-upgrade archive into a fresh volume (C-4)
+and repeat the upgrade.
 
 **C-6. What an empty cache costs, and what a restart already costs, from source.** A plain restart
 of a release build clears only the `Html` and `App` caches, both rebuilt from the database. With

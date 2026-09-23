@@ -106,8 +106,12 @@ the image that adopts the repaired Hiqlite.
 
 ## The repaired Hiqlite (A1, 035) and the N1 repair image
 
-**State.** Hiqlite 035 is a contract at `8e4ec4b` with implementation pending; no candidate source,
-branch or interface exists on any ref (checked 2026-09-23). Nothing below has run.
+**State.** Hiqlite's third-pass notice (`standards/spec/n3-rauthy-request.md`, uncommitted in the
+Hiqlite checkout on 2026-09-23) announces a candidate on branch `fix/035-n1-upgrade-exclusion`
+with an internal fault-point feature, `__upgrade-fault-points`. At 21:25Z that branch pointed at
+`8e4ec4b`, which carries no implementation; the candidate existed only as uncommitted changes in
+another session's working tree, and no remote ref held it. There is therefore no exact candidate
+source to build against, and nothing below has run. Integration starts from a commit id.
 
 **Evidence states, kept apart:**
 
@@ -123,9 +127,17 @@ failing on `0.15.0-patched.1` before it counts):
 
 - live upstream process, then a consent start: refused before any rename; the upstream node keeps
   serving, stops cleanly and restarts; only `hiqlite-owner.lock` added;
-- upstream killed, leaving `state_machine/lock`: refused as an error, no move, `logs/` unchanged;
-- a crash between the two renames (a test-build fault point, or `SIGKILL` timed by Hiqlite's own
-  hook): the next start completes the move or refuses, and never restores a 0.14 snapshot;
+- upstream killed, leaving `state_machine/lock`: Rauthy builds Hiqlite with its default
+  features, which include `auto-heal`, so the marker selects the rebuild policy rather than a
+  refusal. Assert that the start proceeds under the locks, completes the move and rebuilds the
+  database with every row (Hiqlite 035 X-3 for this feature set);
+- an interruption at each of the candidate's fault points (`HQL_TEST_UPGRADE_FAULT`, in a
+  test build only): the next start without consent is refused naming the variable; the next with
+  consent completes into one `pre-upgrade-<secs>/` (no `.partial`) whose cache files are
+  byte-identical to upstream's; SQL rows, users, clients and keys intact;
+- the state the **published** build leaves after a crash between its two renames
+  (`pre-upgrade-<secs>/logs_cache` present, `state_machine_cache` in place, no format marker):
+  refused without consent, finished with it, never restored;
 - a successful upgrade keeps SQL rows, users, clients and signing keys (as leg J does today);
 - the cache is empty after it (auth codes, bans and counters gone), as the handoff states;
 - upstream started over the upgraded directory: **recorded, not passed or failed**, since no

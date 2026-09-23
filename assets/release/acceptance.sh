@@ -313,6 +313,31 @@ run_until_exit "$CONF" 8092 8102 8202 180 HIQLITE=false PG_HOST=127.0.0.1 PG_POR
 assert "a backend failure inside DB::init shut the embedded storage down" $? \
   "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$CONF/rauthy.log" | head -3)"
 
+# The Postgres root CA is read in the same window, after the embedded node has started. Upstream
+# v0.36.2 panics on a PEM block it cannot decode (exit 134) and on a certificate rustls refuses.
+# pg_root_ca_case <name> <dir> <pem>
+pg_root_ca_case() {
+  local name="$1" dir="$2" pem="$3" rc
+  mkdir -p "$dir"; cp "$CONFIG_TEMPLATE" "$dir/config.toml"
+  run_until_exit "$dir" 8078 8126 8226 180 HIQLITE=false PG_HOST=127.0.0.1 PG_PORT=1 \
+    PG_USER=nobody PG_PASSWORD=nobody PG_TLS=require "PG_TLS_ROOT_CA=$pem"
+  rc=$?
+  [ "$rc" -eq 1 ]
+  assert "$name fails the start with exit 1" $? "exit code was $rc"
+  grep -q 'pg_tls_root_ca' "$dir/rauthy.log"
+  assert "the failure names pg_tls_root_ca for $name" $? "$(tail -3 "$dir/rauthy.log")"
+  mv "$dir/rauthy.log" "$dir/first-attempt.log"
+  run_until_exit "$dir" 8078 8126 8226 180 HIQLITE=false PG_HOST=127.0.0.1 PG_PORT=1 \
+    PG_USER=nobody PG_PASSWORD=nobody
+  [ "$(unclean_markers "$dir")" = "0" ]
+  assert "$name shut the embedded storage down" $? \
+    "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$dir/rauthy.log" | head -3)"
+}
+pg_root_ca_case "a root CA that is not valid PEM" "$C/pg-ca-not-pem" \
+  "$(printf -- '-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n')"
+pg_root_ca_case "a root CA that is not a certificate" "$C/pg-ca-not-der" \
+  "$(printf -- '-----BEGIN CERTIFICATE-----\nAAAAAAAA\n-----END CERTIFICATE-----\n')"
+
 # --- D: listener bind failure ------------------------------------------------
 
 log "D. Listener bind failure leaves the data directory clean"
@@ -683,15 +708,15 @@ log "S. A mail configuration that cannot work fails cleanly"
 mail_exit_case() {
   local name="$1" dir="$2" pattern="$3"; shift 3
   mkdir -p "$dir"
-  run_until_exit "$dir" 8093 8123 8223 300 SMTP_CONNECT_RETRIES=0 "$@"
+  run_until_exit "$dir" 8079 8124 8224 300 SMTP_CONNECT_RETRIES=0 "$@"
   local rc=$?
   [ "$rc" -eq 1 ]
   assert "$name fails the start with exit 1" $? "exit code was $rc"
   grep -q "$pattern" "$dir/rauthy.log"
   assert "the failure names $name" $? "$(tail -3 "$dir/rauthy.log")"
   mv "$dir/rauthy.log" "$dir/mail-failure.log"
-  start_node "$dir" 8093 8123 8223
-  wait_ready "$dir" 8093 300
+  start_node "$dir" 8079 8124 8224
+  wait_ready "$dir" 8079 300
   assert "the node starts without the mail configuration after $name" $? "see $dir/rauthy.log"
   [ "$(unclean_markers "$dir")" = "0" ]
   assert "$name shut the storage layer down cleanly" $? \

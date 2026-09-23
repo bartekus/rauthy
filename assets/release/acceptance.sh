@@ -69,7 +69,8 @@ start_node() {
   rm -f "$dir/rc" "$dir/pid"
   (
     cd "$dir"
-    env "$@" \
+    # The caller's assignments come last so that they override these defaults.
+    env \
       HQL_DATA_DIR="$dir/data" \
       HQL_NODES="1 localhost:$raft localhost:$api" \
       LISTEN_ADDRESS=127.0.0.1 \
@@ -80,6 +81,7 @@ start_node() {
       BOOTSTRAP_ADMIN_PASSWORD_PLAIN="$ADMIN_PASSWORD" \
       BOOTSTRAP_API_KEY="$API_KEY_B64" \
       BOOTSTRAP_API_KEY_SECRET="$API_KEY_SECRET" \
+      "$@" \
       "${BIN:-$RAUTHY}" serve -c config.toml >> "$dir/rauthy.log" 2>&1 &
     node=$!
     echo "$node" > "$dir/pid"
@@ -647,6 +649,28 @@ assert "the node starts over HTTP once the TLS material is out of the way" $? "s
 assert "the TLS failure shut the storage layer down cleanly" $? \
   "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$N/rauthy.log" | head -3)"
 stop_node "$N"
+
+# M3: self-signed generation that cannot succeed. The certificate is issued for the PUB_URL host,
+# and a host that is not a valid DNS name is refused by the certificate library. Upstream v0.36.2
+# unwraps that refusal after the storage layer is live and exits 134; the same generation runs
+# again on every renewal of a serving node.
+O="$WORK/o-tls-bad-name"; mkdir -p "$O"
+run_until_exit "$O" 8088 8118 8218 300 LISTEN_SCHEME=https LISTEN_PORT_HTTPS=8448 \
+  TLS_GENERATE_SELF_SIGNED=true "PUB_URL=bücher.localhost:8448"
+RC=$?
+[ "$RC" -eq 1 ]
+assert "a PUB_URL host that cannot name a certificate fails the start with exit 1" $? "exit code was $RC"
+grep -q 'certificate name' "$O/rauthy.log"
+assert "the failure names the certificate problem" $? "$(tail -3 "$O/rauthy.log")"
+
+mv "$O/rauthy.log" "$O/tls-failure.log"
+start_node "$O" 8088 8118 8218
+wait_ready "$O" 8088 300
+assert "the node starts over HTTP after the failed generation" $? "see $O/rauthy.log"
+[ "$(unclean_markers "$O")" = "0" ]
+assert "the failed generation shut the storage layer down cleanly" $? \
+  "$(grep -iE 'not a clean start|did not shut down gracefully|auto-rebuilding' "$O/rauthy.log" | head -3)"
+stop_node "$O"
 
 # --- L: the metrics listener is an exit path too ------------------------------
 

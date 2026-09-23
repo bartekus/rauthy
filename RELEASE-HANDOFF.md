@@ -13,6 +13,80 @@ is what a consumer needs to act.
 > run whose arm64 verification failed on a harness defect; it was never released and has no
 > provenance. The ledger's section 7 has the account.
 
+## Corrections, 2026-09-23 (after publication)
+
+The text below this section is what shipped with `v0.36.2-patched.2` and is left as it was, so
+that it stays a record of what the release said. Six statements in it were too strong. Where one
+of them appears it is marked **[C-n]**, and the advice here replaces it. What the release ran and
+measured is unchanged; ledger section 11 has the evidence behind each correction. The copy of
+this file attached to the release is immutable and does not carry this section.
+
+**C-1. A persistent `503` from `/ready` is not a reason to restart.** `/ready` answers `503` for
+any unconfirmed storage sample: a Postgres outage, a slow Raft leader election, or a terminal
+failure of the embedded node. Only the last one needs a restart, and `503` does not say which.
+Rahi rejects a persistent-unready restart heuristic for that reason. In `0.36.2-patched.2` the
+only terminal indications are the log line naming the node "out of service" and a `500` whose
+body says "The storage layer of this node is out of service" on requests that touch storage.
+A machine-readable `storage: "terminal"` on `/health` is prepared for the next patch level; it
+is not in this release.
+
+**C-2. Nothing here excludes a live upstream Rauthy.** `StorageInUse` is raised by the patched
+Hiqlite's owner lock, which only patched builds take. Upstream `v0.36.2` (Hiqlite `0.14`) holds
+only its WAL locks, and the patched start checks them after it has already moved the cache. With
+`HQL_CACHE_LEGACY_MOVE_ASIDE=true` against a directory a live upstream Rauthy is using, the patched
+start renames that node's `logs_cache` and `state_machine_cache` into `pre-upgrade-<secs>/` and
+only then fails. The old node goes on writing into the moved WAL, fails at its next stop, and the
+directory needs manual repair (Rahi 043 D-P3; Hiqlite F-126, reproduced as its spec 035 P-2).
+Until a Rauthy built on a repaired Hiqlite is released and qualified, the first start with the
+variable requires, as the operator's precondition:
+
+1. the upstream container stopped **and removed**, so that no restart policy can bring it back;
+2. no process holding `<data_dir>/logs/lock.hql` or `<data_dir>/logs_cache/lock.hql` (for example
+   `fuser` or `lsof` on both, from the host or a debug container on the volume);
+3. exactly one start with the variable, from a supervisor that cannot start the old image on the
+   same volume at the same time.
+
+Two patched processes still exclude each other before anything is touched, as stated below.
+
+**C-3. A refusal is not side-effect free.** The legacy-cache refusal ends "Nothing was changed.",
+but the start that refuses has already created `<data_dir>/hiqlite-owner.lock` (and the data
+directory, if it was absent). That is the only addition Rahi (043 D-P2) and Hiqlite (035 P-1)
+observed on the published build; no data file is moved or written. The ledger's section 5 note
+about a checkpointed database file was measured on an earlier Hiqlite tree, in which the check
+ran after the database had been opened; in the published `0.15.0-patched.1` it runs before
+(`start.rs`, `ensure_cache_log_format` before `start_raft_db`, read from source).
+
+**C-4. The supported way back is the pre-upgrade archive, restored into a fresh volume.** Starting
+upstream `v0.36.2` on a directory any patched build has written is **unsupported**. Without the
+manual move it is destructive: Hiqlite `0.14` panicked in 3 of 3 runs over a patched cache and
+tore raft metadata in 2 of them (Hiqlite F-129, 035 P-6). With the manual move it is **not shown
+safe**: the rollback leg J passed only on a directory with no Raft snapshot, and the SQLite raft
+log's compatibility from `0.15` back to `0.14` was not otherwise examined. Before upgrading, stop
+upstream Rauthy and archive the whole data directory; to go back, restore that archive into a
+fresh volume and start upstream there. Everything written after the upgrade is then lost, and
+the operator has to re-apply it.
+
+**C-5. A second consent start is not proof that an interrupted move is safe.** The move renames
+`logs_cache` first and `state_machine_cache` second, and the legacy check looks only for `.wal`
+files in `logs_cache`. A crash between the two renames can leave a `0.14` cache snapshot that the
+next start restores without refusing and without consent (Hiqlite F-130: a defect, confidence
+medium, read from source, not reproduced). The repair is Hiqlite spec 035 B-5, which is not
+released; a Rauthy rebuilt on it is required before this path is qualified. Until then: if the
+first start with the variable does not reach `/ready`, do not start it again. Restore the
+pre-upgrade archive into a fresh volume (C-4) and repeat the upgrade.
+
+**C-6. What an empty cache costs, and what a restart already costs, from source.** A plain restart
+of a release build clears only the `Html` and `App` caches, both rebuilt from the database. With
+the default disk-backed cache everything else survives a restart, so "a restart window already
+tolerates" the losses below is wrong: they are new at the upgrade. The move-aside empties the whole
+cache, which loses, among others: authorization codes, device codes, WebAuthn challenges, PoW
+challenges, DPoP nonces, upstream-provider and ATProto callback state, PAM tokens, **every IP ban,
+manual ones included**, failed-login counters, credential-stuffing windows, rate limits, and the
+grace entry that keeps a rotated client secret valid. The full list, with the source function for
+each, is `RELEASE-STATE-INVENTORY.md`. Sessions, refresh tokens and token revocations are in the
+database and are not lost. "Nothing on the Rauthy side" is missing is withdrawn: C-1, C-2, C-4
+and C-5 are open, and each names what closes it.
+
 ## What this is
 
 A downstream patched build of upstream Rauthy `v0.36.2`, the release `rahi` already runs, on the
@@ -76,15 +150,15 @@ layout changed after `hiqlite 0.14.0`), and it refuses rather than guess. The up
 Step 3 moves `logs_cache` and `state_machine_cache` into
 `<data_dir>/pre-upgrade-<unix seconds>/` (nothing is deleted) and starts with an empty cache.
 Without it the start exits `1` with a message naming the variable and ending "Nothing was
-changed."; that is the designed refusal, not a crash, and nothing on disk has moved.
+changed."; that is the designed refusal, not a crash, and nothing on disk has moved. **[C-3]**
 
 **Effect on rahi:** sessions survive (Rauthy keeps them in its database). In-flight authorization
 codes, device codes, WebAuthn challenges, rate-limit counters and blacklist entries do not, which a
-restart window already tolerates. Rahi's restore probes `rauthy/state_machine/lock` for existence;
-the upgrade does not change that file's meaning. If rahi's cell supervisor starts rauthy with a
-fixed environment, the variable has to reach that one start: set it for the upgrade boot only, or
-leave it set if your supervisor cannot scope it; it is a no-op once the marker exists, and any
-value other than `true`/`false` is a startup error.
+restart window already tolerates. **[C-6]** Rahi's restore probes `rauthy/state_machine/lock` for
+existence; the upgrade does not change that file's meaning. If rahi's cell supervisor starts rauthy
+with a fixed environment, the variable has to reach that one start: set it for the upgrade boot
+only, or leave it set if your supervisor cannot scope it; it is a no-op once the marker exists, and
+any value other than `true`/`false` is a startup error. **[C-5]**
 
 ## Configuration and migration
 
@@ -101,12 +175,12 @@ an environment-only deployment is unaffected. The build stamps `0.36.2-patched.2
 - A node whose storage has failed terminally refuses every request that touches storage (500 with
   "The storage layer of this node is out of service"), stays up, and **is not restarted by
   Rauthy or Hiqlite**. Restarting the process is the recovery path; rahi's supervisor should treat
-  a persistent `503` from `/ready` as "restart this cell".
+  a persistent `503` from `/ready` as "restart this cell". **[C-1]**
 - Backup downloads that cannot be completed fail instead of ending early under a `200`, and the
   local route declares `Content-Length`. `RauthyApi::fetch` sees a transport error through
   `reqwest`; no rahi change is needed.
 - A second process on the same data directory, including a restore aimed at a live node's
-  directory, is refused with `StorageInUse` before anything is touched.
+  directory, is refused with `StorageInUse` before anything is touched. **[C-2]**
 - Startup and background failures after the storage layer is live exit `1` after a storage
   shutdown, where upstream aborted with `134` and the next start rebuilt the state machine:
   a listener or metrics port that cannot bind, unusable TLS material, a `PUB_URL` host that
@@ -129,7 +203,7 @@ an environment-only deployment is unaffected. The build stamps `0.36.2-patched.2
 - **Downgrade to upstream `ghcr.io/sebadob/rauthy:0.36.2`.** Stop, move `logs_cache` and
   `state_machine_cache` out of the data directory **by hand**, start upstream. Upstream has no way
   to refuse a cache log it cannot read, so skipping the move is unsafe. The database and
-  everything the patched build wrote are readable by upstream. Nothing below `v0.36.2` is
+  everything the patched build wrote are readable by upstream. **[C-4]** Nothing below `v0.36.2` is
   supported.
 
 ## Test results
@@ -165,8 +239,8 @@ native amd64 and arm64, strict (a skip fails it):
 
 ## What is still missing
 
-Nothing on the Rauthy side. The package is public and was pulled, inspected and started without
-credentials on both platforms. What remains is adoption, below.
+Nothing on the Rauthy side. **[C-6]** The package is public and was pulled, inspected and started
+without credentials on both platforms. What remains is adoption, below.
 
 ## Explicitly outside this release
 

@@ -1007,7 +1007,9 @@ else
   # directory. That must not reach the client either.
   echo "  INFO the write that met the failure: $(printf '%s' "$P_BODY" | tail -1)" \
     "$(printf '%s' "$P_BODY" | sed '$d' | head -c 200)"
-  ! printf '%s' "$P_BODY" | grep -q "$P_LOGS"
+  # A here-string, not a pipe: under pipefail a SIGPIPE in `printf | grep -q` would be negated
+  # into a pass.
+  ! grep -q "$P_LOGS" <<< "$P_BODY"
   assert "the write that meets the failure does not expose the storage path" $? \
     "$(printf '%s' "$P_BODY" | head -c 300)"
 
@@ -1037,7 +1039,9 @@ else
   assert "a read after the failure is refused" $? "the read answered 200"
   printf '%s' "$READ_BODY" | grep -q "storage layer of this node is out of service"
   assert "the refusal says the storage is out of service" $? "$(printf '%s' "$READ_BODY" | head -c 300)"
-  ! printf '%s' "$READ_BODY" | grep -q "$P_LOGS"
+  # A here-string, not a pipe: under pipefail a SIGPIPE in `printf | grep -q` would be negated
+  # into a pass.
+  ! grep -q "$P_LOGS" <<< "$READ_BODY"
   assert "the refusal does not expose the storage path to the client" $?
 
   stop_node "$P"

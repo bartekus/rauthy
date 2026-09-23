@@ -5,7 +5,9 @@ supported by the upstream project. Upstream's sources, licence and authorship ar
 unchanged apart from the commits listed below.
 
 This file states facts that were measured, and says where a value does not exist yet. Section 7
-is the publication state; it is the section to read first.
+is the publication state; it is the section to read first. The copy attached to a release is the
+one in the tagged tree, written before the publish run existed: the artefact digests are in that
+release's `RELEASE-PROVENANCE.md`, and the ledger on `patched/0.36.2` records them afterwards.
 
 ## 1. Candidate identity
 
@@ -20,7 +22,7 @@ is the publication state; it is the section to read first.
 | Executable name | `rauthy` (unchanged) |
 | Storage dependency | `hiqlite-patched`, `hiqlite-wal-patched`, `hiqlite-derive-patched` `0.15.0-patched.1` |
 | Supported topology | N = 1 |
-| Publication status | **held**: the Hiqlite packages are not on crates.io. Section 7 |
+| Publication status | the dependency is published and resolved from crates.io; publication follows the merge of PR #3. Section 7 |
 
 `patched.1` sits in the SemVer pre-release field because that is the only field a valid SemVer can
 carry it in and still parse, order and satisfy rauthy's own `semver` checks. The consequence is
@@ -59,12 +61,14 @@ row says otherwise.
 | F3 | `GET /auth/v1/ready` answered `200` unconditionally. | Acceptance K (Postgres) and P (Hiqlite) |
 | F4 | An unreadable config file became an empty config with a warning. | Acceptance C |
 | F7 | Five `panic = "abort"` sites in `server_with_metrics()` reached after `DB::init()`. | Acceptance L |
-| F8 | Four more in TLS load and self-signed renewal; the renewal task could abort a serving node. | Measured against the upstream binary: exit 134 upstream, exit 1 with 3 shutdowns patched. Acceptance M |
+| F8 | Four more in TLS load and self-signed renewal; the renewal task could abort a serving node. This row covers the sites in `tls.rs` only; the certificate generation it calls was still panicking, which is F15. | Measured against the upstream binary: exit 134 upstream, exit 1 with 3 shutdowns patched. Acceptance M2 |
 | F9 | The JWK-rotation and MaxMind schedulers `unwrap()`ed operator-supplied cron expressions after the storage layer was live. | Acceptance C |
-| F10 | **New.** `DB::init()` itself: when connecting to Postgres, waiting for a healthy Raft, or reading the membership failed after `hiqlite::start_node_with_cache()` had returned a running node, the client was dropped unstopped. F2 did not cover it, because `run()` only shuts down a client that was stored. The `PG_*` `expect()`s ran in the same window. | Acceptance C, "a backend failure inside DB::init shut the embedded storage down": observed failing with the fix reverted |
-| F11 | **New, found by the integration.** `/ready` answered from the health watcher's debounced sample, so after a terminal storage failure it kept answering `200` for up to 90 s. It now also consults `Client::node_failure()` and answers `503` at once. | Acceptance P, "readiness reports the embedded storage failure within seconds": observed failing (`200`) with the fix reverted |
-| F12 | **New, found by the integration.** The IP-blacklist middleware looks every client up in the cache ahead of every handler. On a failed node that lookup is refused, so the probes answered `500` from the middleware and `/ready`'s `503` never ran. When that lookup fails on one of the three probe paths only, the request proceeds; a blacklisted client is still refused whenever the lookup succeeds. | Acceptance P on the `d45826cd` tree answered `500`; `503` after the fix |
-| F13 | **New.** `hiqlite::Error::NodeFailed` carries an account naming internal components and file paths, and fell through to a catch-all that put it in the response body. The account now goes to the log; the client gets "The storage layer of this node is out of service". | Acceptance P, "the refusal does not expose the storage path to the client" (meaningful only on a Hiqlite tree that refuses reads, see 3.4) |
+| F10 | `DB::init()` itself: when connecting to Postgres, waiting for a healthy Raft, or reading the membership failed after `hiqlite::start_node_with_cache()` had returned a running node, the client was dropped unstopped. F2 did not cover it, because `run()` only shuts down a client that was stored. The `PG_*` `expect()`s ran in the same window. | Acceptance C, "a backend failure inside DB::init shut the embedded storage down": observed failing with the fix reverted |
+| F11 | Found by the integration. `/ready` answered from the health watcher's debounced sample, so after a terminal storage failure it kept answering `200` for up to 90 s. It now also consults `Client::node_failure()` and answers `503` at once. | Acceptance P, "readiness reports the embedded storage failure within seconds": observed failing (`200`) with the fix reverted |
+| F12 | Found by the integration. The IP-blacklist middleware looks every client up in the cache ahead of every handler. On a failed node that lookup is refused, so the probes answered `500` from the middleware and `/ready`'s `503` never ran. When that lookup fails on one of the three probe paths only, the request proceeds; a blacklisted client is still refused whenever the lookup succeeds. | Acceptance P on the `d45826cd` tree answered `500`; `503` after the fix |
+| F13 | `hiqlite::Error::NodeFailed` carries an account naming internal components and file paths, and fell through to a catch-all that put it in the response body. The account now goes to the log; the client gets "The storage layer of this node is out of service". | Acceptance P, "the refusal does not expose the storage path to the client" (meaningful only on a Hiqlite tree that refuses reads, see 3.4) |
+| F15 | **New, found by review round 11.** Self-signed certificate generation (`SelfSignedCA`), which runs at startup and on every renewal of a serving node, after `DB::init()`, `unwrap()`ed eight results: the stored CA row's decoding, key generation and parsing, both signatures, and the certificate name taken from `PUB_URL`. A `PUB_URL` host that is not a valid DNS name (non-ASCII, for one) aborted the start. Each is now an error; at startup that fails the start through the storage shutdown, and in the renewal task it is logged and retried. | Measured: `PUB_URL=bücher.localhost:8448` with self-signed TLS exits 134 on the unfixed tree, and the next start reports 3 unclean-shutdown markers; exit 1 and a clean next start with the fix. Acceptance M3, observed failing (3 of 4 assertions) without the fix |
+| F16 | **New, found tracing the shutdown contract.** The mail sender connects to SMTP after `DB::init()`. An incomplete configuration (`SMTP_URL` without `SMTP_USERNAME` or `SMTP_PASSWORD`, an unusable `SMTP_URL` or `SMTP_ROOT_CA`, an unparsable `SMTP_FROM`) hit an `expect()` and aborted with the storage layer live. Exhausted connection retries called `shutdown().await.unwrap()` and then `panic!`: under the patched Hiqlite `shutdown()` reports a failed stop, so the `unwrap()` became a second abort site. All of these now shut the storage layer down and exit `1` with the reason logged; a failed shutdown is logged, not unwrapped. | Measured: `SMTP_URL` without `SMTP_USERNAME` exits 134 on the unfixed tree and the next start reports 3 unclean-shutdown markers. Acceptance S (three cases, 12 assertions): 5 of them fail on the unfixed tree |
 
 ### 3.2 Test defects and coverage gaps (no product change)
 
@@ -84,6 +88,15 @@ row says otherwise.
 - **Upstream's `code_style.yaml` declared no `permissions`,** so on this fork (default `write`) a
   pull-request job held a token that could push. It now declares `contents: read`.
 - **The image ships `LICENSE`.** Apache-2.0 requires a copy with every redistribution.
+
+- **The publish gate accepted the best review, not every review.** It took any successful review
+  run on the reviewed head, so a blocking verdict followed by a rerun or a dispatched second run
+  that happened to pass would have been accepted. Every review run on that head must now be a
+  first-attempt `pull_request` run that succeeded; a head with a blocking verdict needs a new
+  commit.
+- **The acceptance harness let its defaults override a scenario's environment.** `start_node`
+  passed the caller's assignments to `env` before its own, so a scenario could not set `PUB_URL`.
+  No existing leg set a conflicting variable; M3 needed to.
 
 Downstream identity, not a defect fix: the version marker, the startup log line naming distributor
 and upstream base, the `patched.N` marker being recognised instead of warned about as an upstream
@@ -116,7 +129,10 @@ Reported to the Hiqlite release owner with evidence; repaired in `bartekus/hiqli
   user before a concurrent picture upload saves it back without the picture. Present in upstream
   `v0.36.2`, unrelated to storage, and outside this release's scope; a candidate for upstream.
 - **The per-request `panic = "abort"` surface** in `src/api`, `src/service` and `src/data` was
-  spot-checked, not audited (unchanged from PR #2).
+  spot-checked, not audited (unchanged from PR #2). F15 and F16 closed the startup and background
+  paths found since; still present: the Microsoft Graph mail sender `expect()`s its OAuth token on
+  every send, and the SMTP sender `unwrap()`s each recipient address, which upstream validates
+  before it queues a mail.
 - **Config-layer aborts.** Config errors abort the process before `DB::init()`; nothing is at
   stake, but a supervisor sees an abort, not a clean exit.
 
@@ -145,6 +161,7 @@ Reported to the Hiqlite release owner with evidence; repaired in `bartekus/hiqli
 | `hiqlite-patched` | `=0.15.0-patched.1` via `hiqlite = { package = "hiqlite-patched", ... }` | crates.io, `456c1c117e5c581f6638572f26d9ef7cd567738c578e42ff0c8e09300534e7ca` |
 | `hiqlite-wal-patched` | pulled in by the above | crates.io, `024992a08719a870bcef79192ed392cbef758b39caf0a60167541df379a05a9b` |
 | `hiqlite-derive-patched` | pulled in by the above | crates.io, `e2380bba9eb80f5d7ecb5a59097b91bed1a3600f9d6e659ad37362e6cb2df077` |
+| `openraft` | `0.9.25`, pinned `=0.9.25` by `hiqlite-patched` | crates.io, `a97014fb78acb77be3a40ac2da305f6dd3a6b243f3a908ace87d29b3972eaafd` |
 
 Provenance, checked independently of the Hiqlite owner's report: the crates.io API returns these
 three checksums, none yanked, published by `bartekus` on 2026-09-22; each downloaded `.crate`
@@ -155,7 +172,17 @@ tag `v0.15.0-patched.1` in `bartekus/hiqlite`
 candidate this release was exercised on (`e1e91355`), the published tree changes WAL rollover and
 flush failure handling, S3 retention filtering, the cache-format check on a reset start, and a
 dlock handler; acceptance P injects exactly the rollover failure.
-| `openraft` | `0.9.25` | crates.io, `a97014fb78acb77be3a40ac2da305f6dd3a6b243f3a908ace87d29b3972eaafd` |
+
+The Hiqlite owner's evidence, checked here against the forge: the tag object is signed and GitHub
+reports it `verified`; its CI `Check` run `35789836641` ran on `9fd491f0`, whose tree
+(`fa07fcb1`) is identical to the tagged commit's; the publish run `35793410166` and the 33-block
+acceptance run `35791749020` ran on the tagged commit itself, all first attempt, all `success`.
+F-107 was read in the published source, not taken from the report: `Client::shutdown()` closes
+membership admission first, a drain timeout returns `Err` before any component is stopped, the
+sequence runs in its own task so a caller's timeout cannot cut it between two raft groups, and six
+`start_paused` tests in `membership_gate.rs` drive the interleavings. None of that is reachable at
+N = 1, where no membership change is ever admitted. Rauthy's shutdown call sites log an `Err` and
+exit non-zero (the one that `unwrap()`ed it is F16), so the new result needs no other adaptation.
 
 The alias keeps the dependency key `hiqlite`, so no `use hiqlite::...` moves and the derive
 macros' absolute `::hiqlite::` paths resolve. `cargo check`, clippy with `-D warnings`, and the
@@ -231,7 +258,7 @@ own data directory and ports.
 |---|---|---|---|
 | Release identity, version output | A | n/a | `--version`, marker handling |
 | First boot, production frontend | B | Hiqlite | ready, health, JWKS, identity; the served index references a built bundle and the bundle and `/account` are served |
-| Bad configuration, bind failure with cleanup | C, D | both | F4, F9, F10, F2 |
+| Bad configuration, bind failure with cleanup | C, D, M3, S | both (M3 and S: Hiqlite) | F4, F9, F10, F2, F15, F16 |
 | Real competing processes | E | Hiqlite | `StorageInUse`, first node unharmed |
 | Normal shutdown, restart | F | Hiqlite | clean exit `0`, no unclean markers, keys survive |
 | Interrupted run, recovery | Q | Hiqlite | SIGKILL under write load; the next start must report the unclean shutdown; acknowledged writes, keys and identity survive; the recovered node shuts down cleanly |
@@ -240,7 +267,7 @@ own data directory and ports.
 | Live storage failure, Postgres | K | Postgres | the database container is stopped under a live node: `/ready` `503`, `/health` `500` |
 | Live storage failure, embedded Hiqlite | P | Hiqlite | the Raft log directory is made read-only and writes are driven until the WAL writer cannot rotate: `/ready` `503` within seconds, `/health` `500`, writes and reads refused with no storage path in the body, no abort, SIGTERM exit without a kill, recovery with every acknowledged write |
 | Upgrade and rollback against the real baseline | J | Hiqlite | the upstream `v0.36.2` binary from its own image writes data; the raw upgrade is refused with its raft log byte-identical and its database content unchanged; the opt-in upgrade keeps keys, identity and upstream-written data and moves the cache aside; a later start needs no opt-in; the rollback reads patched-written data |
-| TLS and metrics exit paths | M, L | Hiqlite | F8, F7 |
+| TLS and metrics exit paths | M, L | Hiqlite | F8, F15, F7 |
 | Login, session, logout | `handler_auth`, `handler_users`, `handler_sessions` | both | |
 | Native clients, device grant, refresh, revocation, bearer writes | `handler_auth::{test_device_code_flow, test_token_revocation, test_password_flow, test_dpop, test_client_credentials_flow}`, `handler_api_keys` | both | F6 |
 | Audience and scope negative cases | `zzf_handler_resource_indicators`, `zzg_handler_token_exchange`, `handler_scopes` | both | |
@@ -266,6 +293,8 @@ and cannot qualify publication.
 | Hiqlite `34641b0a` | CI run `35771464936`, amd64 and arm64 | 113 passed, 1 failed (the refused upgrade's byte-level database check, which found the checkpoint described in section 5), 0 skipped; integration suites green on both backends |
 | Hiqlite `e1e91355` (tip `ae2408c8`) | CI run `35783026757`, every job | the same figures after the leg E fix, now counting a leg E assertion that can fail: acceptance 117/0/0 strict on amd64 and arm64; both integration suites; Rahi 606 passed, 0 failed, 1 ignored by Rahi |
 | Hiqlite `e1e91355` (tip `f5323a2c`) | CI run `35775723599`, every job | acceptance **117 passed, 0 failed, 0 skipped, strict** on amd64 and on arm64; integration suites green on both backends; Rahi's whole live suite 606 passed, 0 failed, 1 ignored by Rahi itself, no skips, passkey-only backup administrator proof passing. The last scratch run: the graph is git-sourced, so it cannot qualify publication |
+| **published `0.15.0-patched.1`** (tip `00e411ed`) | CI run `35796064248`, every job, first attempt | acceptance **117 passed, 0 failed, 0 skipped, strict** on amd64 and on arm64; both integration suites; Rahi 606 passed, 0 failed, 1 ignored by Rahi. The registry graph, but not the final tree: review round 11 then found F15, and F16 was found tracing the shutdown contract, so it does not qualify publication |
+| M3 and S only, published Hiqlite | local, macOS arm64, debug build | 16 passed, 0 failed with F15 and F16; 8 passed, 8 failed with both reverted (the unfixed tree exits 134 in all four cases) |
 | Hiqlite `c7d0d6a9` | CI run `35764291279`, consumer job | Rahi's whole live suite: 606 passed, 0 failed, 1 ignored by Rahi itself, no skips; the passkey-only backup administrator proof ran and passed |
 
 The qualifying run is the one section 7 names, on the merge commit, against the published graph.
@@ -281,26 +310,28 @@ The qualifying run is the one section 7 names, on the merge commit, against the 
 
 ## 7. Publication status
 
-**Held.** The one remaining condition is outside this repository:
+**Ready to publish once PR #3 merges.** Nothing outside this repository remains: the patched
+Hiqlite packages are on crates.io (section 4) and this tree resolves them with no path, git or
+`[patch]` source.
 
-> `hiqlite-patched`, `hiqlite-wal-patched` and `hiqlite-derive-patched` `0.15.0-patched.1` are not
-> on crates.io (checked against the crates.io API), and `bartekus/hiqlite` has no release tag for
-> them. Their tree is `release/downstream-packaging` @ `e1e91355`, with its PRs #25 to #30 open.
+The sequence, each step a precondition of the next:
 
-When they are published, the change here is one line in `Cargo.toml` (git source to
-`version = "=0.15.0-patched.1"`) and the lock, then:
-
-1. `check_graph.py Cargo.lock` must pass as a release graph, and the published checksums and
-   source commit must be the ones the Hiqlite owner reports.
-2. The candidate workflow runs on the branch, a pull request into `patched/0.36.2` gets the
-   independent review, findings are addressed, and the pull request is merged.
-3. The candidate workflow runs again **on the merge commit**; that run, strict, first attempt, is
-   the only one the publish gate accepts.
-4. `release-publish.yaml` is dispatched from `patched/0.36.2` with that run's id.
-5. If the GHCR package is private after the first push, making it public is an owner action no
+1. `check_graph.py Cargo.lock` passes as a release graph (done; section 4).
+2. The candidate workflow is green on the pull request's final head, and the independent review
+   of that exact head ends `VERDICT: no blocking findings` on its first attempt (section 9).
+3. PR #3 is merged into `patched/0.36.2`.
+4. The candidate workflow runs **on the merge commit**. That run, first attempt, strict, is the
+   only one the publish gate accepts; its binaries are the bytes that ship.
+5. `release-publish.yaml` is dispatched from `patched/0.36.2` with that run's id. It pushes the
+   image, verifies it on both architectures, then creates the tag and the release.
+6. If the GHCR package is private after the first push, making it public is an owner action no
    workflow token can perform:
    https://github.com/users/bartekus/packages/container/rauthy-patched/settings -> Change package
-   visibility -> Public.
+   visibility -> Public. The publish run checks anonymously and reports it.
+
+The values that only a publish run can produce (tag, image index and platform digests, binary
+checksums, run links) are in the release's `RELEASE-PROVENANCE.md`, and are recorded on
+`patched/0.36.2` afterwards, without moving the tag.
 
 `.cargo/config.toml` sets `global-min-publish-age = '10 days'` under `[unstable]`; only nightly
 cargo honours it, and this release builds on stable `1.95.0`, so a freshly published package is
@@ -370,8 +401,24 @@ check every API Rauthy relies on, confirmed the leg E fix and the verdict gate, 
 findings`. The same head's candidate run `35783026757` is green in every job: acceptance
 117/0/0 strict on amd64 and arm64, both integration suites, Rahi 606 passed, 0 failed.
 
-The final head, carrying the registry graph, gets its own review round before merge; the publish
-gate requires a successful review run on that exact head.
+**Round 11** (review run `35796068651`, head `00e411ed`, the first head on the registry graph):
+`VERDICT: blocking findings`, two of them, both real.
+
+1. The ledger's section 1 and 7 and the whole handoff still said publication was held on the
+   Hiqlite packages, after section 4 recorded them as published. Both files ship with the
+   release. Rewritten.
+2. F8's claim was broader than its fix: `tls.rs` no longer panicked, but the certificate
+   generation it calls still `unwrap()`ed, reachable from `PUB_URL`, at startup and on every
+   renewal. Reproduced (exit 134, 3 unclean markers on the next start), fixed as F15, with
+   acceptance M3 observed failing without the fix.
+
+Following the second finding through the patched Hiqlite's changed `shutdown()` result found F16
+in the mail sender, and the gate's acceptance of the best review rather than every review
+(section 3.3). The candidate run on the same head, `35796064248`, was green in every job; it is
+superseded because the tree changed.
+
+The final head gets its own review round before merge; the publish gate requires every review run
+on that exact head to be a successful first attempt.
 
 ## 10. Upstream return path and maintenance
 

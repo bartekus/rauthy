@@ -3,10 +3,10 @@
 For the session that adopts this build in `rahi`. The evidence is in `RELEASE-LEDGER.md`; this file
 is what a consumer needs to act.
 
-> **Publication is held.** The image and the GitHub release do not exist yet, because the patched
-> Hiqlite packages this release must resolve are not on crates.io. Everything below is final
-> except the artefact values, which no one can write down before a publish run produces them: pin
-> from the `RELEASE-PROVENANCE.md` that run attaches to the release, never from this file.
+> **Pin from the release's `RELEASE-PROVENANCE.md`, never from this file.** This copy is the one
+> in the tagged tree, written before the publish run produced the artefacts. Everything below is
+> final except those values: the image digests, the binary checksums and the run links. The copy
+> on `patched/0.36.2` records them once the release exists.
 
 ## What this is
 
@@ -99,6 +99,13 @@ an environment-only deployment is unaffected. The build stamps `0.36.2-patched.1
   `reqwest`; no rahi change is needed.
 - A second process on the same data directory, including a restore aimed at a live node's
   directory, is refused with `StorageInUse` before anything is touched.
+- Startup and background failures after the storage layer is live exit `1` after a storage
+  shutdown, where upstream aborted with `134` and the next start rebuilt the state machine:
+  a listener or metrics port that cannot bind, unusable TLS material, a `PUB_URL` host that
+  cannot name a self-signed certificate, an incomplete SMTP configuration or an unparsable
+  `SMTP_FROM`, and exhausted SMTP connection retries (which upstream also ended, with `134`, after
+  its own shutdown). A supervisor that restarts on any non-zero exit sees no difference; one that
+  inspects the code sees `1`.
 
 ## Backup, restore and downgrade
 
@@ -118,15 +125,16 @@ an environment-only deployment is unaffected. The build stamps `0.36.2-patched.1
 
 ## Test results
 
-Section 7 of the ledger names the qualifying run once it exists; it is the run on the merge commit
-against the published Hiqlite. Until then the results in ledger section 6 are scratch evidence
-against the git-sourced Hiqlite candidate. What the qualifying run covers, on native amd64 and
-arm64, strict (a skip fails it):
+The qualifying run is the candidate run on the merge commit, against the published Hiqlite; the
+release's `RELEASE-PROVENANCE.md` names it, and the publish gate refuses anything else. Earlier
+results in ledger section 6 are history: some ran against a git-sourced Hiqlite, and the last one
+on the registry graph ran on a tree that has since changed. What the qualifying run covers, on
+native amd64 and arm64, strict (a skip fails it):
 
 - both integration suites (Hiqlite and Postgres backends);
-- the process-level legs A to R, including a real embedded-storage failure (P), a real Postgres
-  failure (K), a kill under write load (Q), a restore aimed at an owned directory (R), and the
-  upgrade and rollback against the real upstream `v0.36.2` binary from its own image (J);
+- the process-level legs A to S, including the self-signed certificate and mail exit paths (M3,
+  S), a real embedded-storage failure (P), a real Postgres failure (K), a kill under write load
+  (Q), a restore aimed at an owned directory (R), and the upgrade and rollback against the real upstream `v0.36.2` binary from its own image (J);
 - rahi's own whole live suite at `b815b18c`, with `RAHI_REQUIRE_RAUTHY=1`, against an image built
   from the candidate bytes, which includes rahi's passkey-only backup administrator proof. amd64
   only. It was run in CI from a pinned checkout of the public repository; the rahi working copy was
@@ -144,19 +152,23 @@ arm64, strict (a skip fails it):
 
 ## What is still missing
 
-1. **The patched Hiqlite packages on crates.io.** Then this release swaps the git source for the
-   published version, reruns the candidate, gets its review, merges, reruns on the merge commit and
-   publishes from that run.
-2. **Possibly one owner action:** if the GHCR package is private after the first push,
-   https://github.com/users/bartekus/packages/container/rauthy-patched/settings -> Change package
-   visibility -> Public. The publish run checks anonymously and says so.
+**Possibly one owner action:** if the GHCR package is private after the first push,
+https://github.com/users/bartekus/packages/container/rauthy-patched/settings -> Change package
+visibility -> Public. The publish run checks anonymously and says so. Nothing else outside this
+repository blocks publication.
 
 ## Explicitly outside this release
 
 - `rahi` must adopt and publish the new image pin and the one-time upgrade variable. Publishing
   rauthy does not do that.
 - `rahi`'s application-side Hiqlite dependency is a separate dependency path from the copy embedded
-  in rauthy. Adopting this image does not change it.
+  in rauthy. Adopting this image does not change it. Carrying the patched Hiqlite there means
+  changing `rahi-store`'s manifest to the aliased declaration (`hiqlite = { package =
+  "hiqlite-patched", version = "=0.15.0-patched.1", default-features = false, features = [...] }`),
+  removing the workspace's `[patch.crates-io]` entry, and publishing a new `rahi-store` and `rahi`,
+  as the Hiqlite handoff's section 10 sets out. Its disk-backed cache needs the same one-time
+  `HQL_CACHE_LEGACY_MOVE_ASIDE=true` start, and its `dlock` is a lease, not a fence (Hiqlite
+  F-026).
 - Aicortex and Statecraft need their own dependency adoption and acceptance.
 - Statecraft's object-store writer fencing is not addressed by this release.
 - Nothing here is deployed. This is not a production deployment.

@@ -1240,6 +1240,11 @@ group_exists 8081 acceptance_before_kill
 assert "the write acknowledged before the kill survives it" $?
 [ "$(jwks_kid 8081)" = "$KID_Q" ]
 assert "the signing key survives the kill" $? "before: $KID_Q after: $(jwks_kid 8081)"
+# The rebuilt state machine is readable before it has replayed its log; a startup read then saw
+# an empty database and bootstrapped it again (CI run 35977264343, arm64).
+! grep -q "Initializing empty production database" "$Q/rauthy.log"
+assert "the recovered node does not bootstrap its database again" $? \
+  "$(grep -m1 'Initializing empty production database' "$Q/rauthy.log")"
 [ -n "$(admin_identity 8081)" ]
 assert "the identity survives the kill" $?
 [ "$(create_group 8081 acceptance_after_kill)" = "200" ]

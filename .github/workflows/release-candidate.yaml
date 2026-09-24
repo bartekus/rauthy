@@ -33,6 +33,8 @@ env:
   RUST_VERSION: '1.95.0'
   BUILD_IMAGE: 'rust:1.95.0-bookworm'
   UPSTREAM_BASE_IMAGE: 'ghcr.io/sebadob/rauthy:0.36.2'
+  # The previous published patched release, pinned by index digest, for acceptance leg V.
+  PREVIOUS_PATCHED_IMAGE: 'ghcr.io/bartekus/rauthy-patched:0.36.2-patched.2@sha256:ea114a8bb743d578dea6d7800916ee43550939c749a2cf586f9abdc0d0c52478'
   # The consumer whose own live suite runs against this candidate, at a pinned commit of its
   # public repository. Bumped deliberately, never followed.
   CONSUMER_REPO: 'statecrafting/rahi'
@@ -244,6 +246,37 @@ jobs:
           mv target/release/rauthy "rauthy_${{ matrix.arch }}"
           sha256sum "rauthy_${{ matrix.arch }}" > "rauthy_${{ matrix.arch }}.sha256"
 
+      # A test-only build with Hiqlite's `__upgrade-fault-points`, for leg J's interruption cases.
+      # Built after the release binary has been moved out, from a manifest edited only for this
+      # build and restored afterwards; a feature does not change Cargo.lock, which is checked.
+      # Its artifact name must not match the publish workflow's `rauthy-*` pattern.
+      - name: Build the leg J fault-point binary (test only, never published)
+        run: |
+          set -euxo pipefail
+          jemalloc_env=""
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            jemalloc_env="-e JEMALLOC_SYS_WITH_LG_PAGE=16"
+          fi
+          sed -i 's/"listen_notify_local", "macros"$/"listen_notify_local", "macros", "__upgrade-fault-points"/' Cargo.toml
+          git diff --exit-code --quiet Cargo.toml && { echo "the fault feature was not added" >&2; exit 1; }
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -u "$(id -u):$(id -g)" \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_HOME=/work/.cargo-home \
+            $jemalloc_env \
+            rauthy-ci-builder \
+            bash -euxc 'cargo build --release --locked'
+          git checkout -- Cargo.toml
+          git diff --exit-code Cargo.lock
+          mv target/release/rauthy "fault_rauthy_${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fault-build-${{ matrix.arch }}
+          path: fault_rauthy_${{ matrix.arch }}
+          retention-days: 30
+
       - name: Record what the binary links against
         run: |
           set -euxo pipefail
@@ -313,7 +346,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: rauthy-${{ matrix.arch }}
-      - run: chmod +x "rauthy_${{ matrix.arch }}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: fault-build-${{ matrix.arch }}
+      - run: chmod +x "rauthy_${{ matrix.arch }}" "fault_rauthy_${{ matrix.arch }}"
 
       # The upstream release this build is based on, taken from its own published image, so the
       # upgrade and rollback legs run against the real baseline rather than a rebuild of it.
@@ -327,6 +363,16 @@ jobs:
           chmod +x ./rauthy_upstream
           ./rauthy_upstream --version
 
+      - name: Extract the previous patched release's binary
+        run: |
+          set -euxo pipefail
+          docker pull "$PREVIOUS_PATCHED_IMAGE"
+          id="$(docker create "$PREVIOUS_PATCHED_IMAGE")"
+          docker cp "$id:/app/rauthy" ./rauthy_previous
+          docker rm "$id" >/dev/null
+          chmod +x ./rauthy_previous
+          ./rauthy_previous --version
+
       - name: Run the release acceptance
         env:
           # Keep the run inside the workspace so its logs can be uploaded on failure.
@@ -334,6 +380,8 @@ jobs:
           # A skipped leg fails the run: a candidate that could not run a leg is not qualified
           # for it, however the job's colour reads.
           ACCEPTANCE_STRICT: '1'
+          RAUTHY_FAULT: ${{ github.workspace }}/fault_rauthy_${{ matrix.arch }}
+          RAUTHY_PREVIOUS: ${{ github.workspace }}/rauthy_previous
         run: |
           set -euo pipefail
           mkdir -p "$ACCEPTANCE_WORK"

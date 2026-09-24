@@ -22,6 +22,7 @@
 # RAUTHY_FAULT names a test build with Hiqlite's `__upgrade-fault-points` feature, for leg J's
 # interruption cases; without it they are skipped. J_EXPECT=published turns leg J into a negative
 # control for a build on the published Hiqlite 0.15.0-patched.1 (see leg J).
+# RAUTHY_PREVIOUS names the previous published patched build, for leg V's upgrade from it.
 
 set -uo pipefail
 
@@ -866,6 +867,51 @@ else
   record "J-I: meta.hql sizes afterwards (logs, logs_cache)" \
     "$(wc -c < "$JI/data/logs/meta.hql" 2>/dev/null | tr -d ' '), $(wc -c < "$JI/data/logs_cache/meta.hql" 2>/dev/null | tr -d ' ')"
   record "J-I: state_machine/lock left behind" "$([ -e "$JI/data/state_machine/lock" ] && echo yes || echo no)"
+fi
+
+# --- V: upgrade from the previous patched release ------------------------------
+#
+# RAUTHY_PREVIOUS names the previous published patched build (taken from its own image). It
+# upgrades a directory upstream wrote, as its handoff says; the candidate then takes that
+# directory over without consent, and again with the variable left set, moving nothing.
+
+log "V. Upgrade from the previous patched release"
+if [ -z "$UPSTREAM" ] || [ -z "${RAUTHY_PREVIOUS:-}" ]; then
+  skip "upgrade from the previous patched release" "needs the upstream and RAUTHY_PREVIOUS binaries"
+else
+  JV="$(j_case v "$J_GOLD")"
+  BIN="$RAUTHY_PREVIOUS" start_node "$JV" $JP "${JENV[@]}" HQL_CACHE_LEGACY_MOVE_ASIDE=true
+  wait_ready "$JV" 8099 60
+  assert "V: the previous patched build upgrades the upstream directory" $? "see $JV/rauthy.log"
+  [ "$(create_group 8099 v_written_by_previous)" = "200" ]
+  assert "V: the previous patched build accepts a write" $?
+  stop_node "$JV"
+  [ "$(cat "$JV/rc" 2>/dev/null)" = "0" ]
+  assert "V: the previous patched build stops cleanly" $? "exit $(cat "$JV/rc" 2>/dev/null)"
+  V_MOVED="$(j_pre_upgrade "$JV/data")"
+  [ "$(printf '%s\n' "$V_MOVED" | grep -c .)" = "1" ]
+  assert "V: the previous build left exactly one pre-upgrade directory" $? "$V_MOVED"
+
+  for vc in without with; do
+    if [ "$vc" = "with" ]; then VCON=(HQL_CACHE_LEGACY_MOVE_ASIDE=true); else VCON=(); fi
+    mv "$JV/rauthy.log" "$JV/before-$vc.log"
+    start_node "$JV" $JP "${JENV[@]}" "${VCON[@]}"
+    wait_ready "$JV" 8099 60
+    assert "V: the candidate starts on the previous build's directory $vc consent" $? \
+      "see $JV/rauthy.log"
+    [ "$(j_identity 8099)" = "$J_ID_UP" ] && group_exists 8099 j_written_by_upstream \
+      && group_exists 8099 v_written_by_previous
+    assert "V ($vc consent): keys, users, clients and both releases' rows survive" $? \
+      "$(j_identity 8099)"
+    [ "$(j_pre_upgrade "$JV/data")" = "$V_MOVED" ] \
+      && [ "$(cat "$JV/data/logs_cache/hiqlite-cache-log-format" 2>/dev/null)" = "2" ]
+    assert "V ($vc consent): nothing is moved again" $? "$(j_pre_upgrade "$JV/data")"
+    [ "$(create_group 8099 "v_written_by_candidate_$vc")" = "200" ]
+    assert "V ($vc consent): the candidate accepts a write" $?
+    stop_node "$JV"
+    [ "$(cat "$JV/rc" 2>/dev/null)" = "0" ]
+    assert "V ($vc consent): the candidate stops cleanly" $? "exit $(cat "$JV/rc" 2>/dev/null)"
+  done
 fi
 
 # --- M: TLS is an exit path too -----------------------------------------------

@@ -1,11 +1,12 @@
-# Release ledger: Rauthy 0.36.2-patched.2
+# Release ledger: Rauthy 0.36.2-patched.2 and 0.36.2-patched.3
 
 A downstream patched distribution of Rauthy. **Not an upstream release**, not endorsed by and not
 supported by the upstream project. Upstream's sources, licence and authorship are carried
 unchanged apart from the commits listed below.
 
-This file states facts that were measured, and says where a value does not exist yet. Section 7
-is the publication state; it is the section to read first. The copy attached to a release is the
+This file states facts that were measured, and says where a value does not exist yet. Sections 1
+to 10 are the record of `0.36.2-patched.2`, and section 7 is its publication state. Section 11 is
+the work after it; **section 12 is `0.36.2-patched.3`**, and the section to read first for it. The copy attached to a release is the
 one in the tagged tree, written before the publish run existed: the artefact digests are in that
 release's `RELEASE-PROVENANCE.md`, and the ledger on `patched/0.36.2` records them afterwards.
 
@@ -527,7 +528,7 @@ This line tracks upstream `v0.36.x`. An upstream patch release becomes `0.36.<z>
 `release/` branch cut from that tag, with this ledger and the acceptance matrix re-run in full.
 Patch levels within one base increment. Published tags never move.
 
-## 11. After publication: corrections and the next patch level (unreleased)
+## 11. After publication: corrections and the next patch level (released as patched.3, section 12)
 
 Recorded 2026-09-23 on the local branch `work/0.36.2-patched.3`, cut from `patched/0.36.2` at
 `513bcc98`. **Nothing in this section is released, pushed or qualified.** Sections 1 to 10 stay
@@ -651,3 +652,62 @@ CI runs: `release-candidate.yaml` does not build a fault-point binary or set `RA
 strict run would skip J-F and fail; and leg J's default expectations fail on any build still on
 `0.15.0-patched.1`, so the harness change belongs only with the repin. These fixes follow the
 recorded runs and have not been run.
+
+## 12. `0.36.2-patched.3`
+
+Prepared 2026-09-24 on `release/0.36.2-patched.3`, cut from `patched/0.36.2` at `513bcc98`. The
+owner chose one combined release (section 11, "Owner decisions" in
+`RELEASE-PRODUCER-RESPONSES.md`): F20, F21 and the rebuild on the repaired Hiqlite.
+
+### 12.1 Identity
+
+| | |
+|---|---|
+| Version | `0.36.2-patched.3` |
+| Upstream base | `v0.36.2` = `dd61ac3c84d6b238108dc8438b53043b5177a662` |
+| Storage dependency | `hiqlite-patched`, `hiqlite-wal-patched`, `hiqlite-derive-patched` `=0.15.0-patched.2`, crates.io |
+| Image | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.3` |
+| Supported topology | N = 1 |
+| Publication status | **not published**. Digests, runs and the tag are recorded here after the publish run, as in section 7 |
+
+### 12.2 Dependency graph
+
+| package | version | checksum (crates.io) |
+|---|---|---|
+| `hiqlite-patched` | `0.15.0-patched.2` | `67ae1ca7cd5c601fc0176f5e6e15dfc480b088b048ed9d482add288f655c229d` |
+| `hiqlite-wal-patched` | `0.15.0-patched.2` | `d65dd8c35c40f8204c64c62a549614da93078e12d290e7db48937bc6c828d290` |
+| `hiqlite-derive-patched` | `0.15.0-patched.2` | `ce54d2189eadd47c368537b9a6687afef94df64a1eed0ae192614f350a57f2e2` |
+| `openraft` | `0.9.25` | unchanged |
+
+Hiqlite `0.15.0-patched.2` is tag `v0.15.0-patched.2` at `5c2cdef6` on `bartekus/hiqlite`. Its crate
+sources are identical to `26e2fa0a`, the candidate section 11.6 tested from git: `git diff
+26e2fa0a v0.15.0-patched.2` touches no `.rs` file, only the three versions, the README, and the
+sibling requirements, which are now exact (`=0.15.0-patched.2`). That closes the caret caveat of
+11.6 for this graph, and `check_graph.py` now also refuses patched packages at different versions
+(checked against a lock with the WAL crate edited to a later version: refused). Apart from the
+three Hiqlite packages and the workspace's own version, `Cargo.lock` is unchanged.
+
+### 12.3 Changes against `0.36.2-patched.2`
+
+| # | change | where |
+|---|---|---|
+| F20 | DPoP nonce enforcement and renewal margin | 11.3. Reported privately to the upstream maintainer before this branch was pushed (GitHub private vulnerability reporting, 2026-09-24) |
+| F21 | `/health` `storage` | 11.3 |
+| H-2 | Hiqlite `0.15.0-patched.2`: live-node exclusion before any rename, resumable consent move, refusals that name what they created, WAL locks held to the last write | 12.2 |
+| | leg J rewritten for H-2 against the real upstream `v0.36.2`, including J-F's seven interruption points | 11.6 |
+| | new leg V: upgrade from the published `0.36.2-patched.2` image, then this build without and with the variable | |
+| | the candidate workflow builds a test-only fault-point binary per architecture (artifact `fault-build-<arch>`, outside the publish workflow's `rauthy-*` pattern) and passes it to leg J; it extracts the previous release's binary from its pinned image for leg V | |
+| | `check_graph.py` refuses patched packages at different versions | |
+
+### 12.4 Evidence before the pull request
+
+| check | where | tree | result |
+|---|---|---|---|
+| `cargo fmt --all --check`, `cargo clippy --workspace --locked -- -D warnings` | macOS arm64 | this branch | clean |
+| workspace unit tests (`--lib`) | macOS arm64 | this branch | 88 passed, 0 failed |
+| `check_graph.py Cargo.lock` | | this branch | release graph |
+| integration suites, leg J | | `26e2fa0a` from git | 11.6; same crate sources |
+
+Leg V, the fault-point build in CI and native amd64 have not run before the pull request. The
+qualifying evidence is the candidate run on the merge commit, as in section 7.
+

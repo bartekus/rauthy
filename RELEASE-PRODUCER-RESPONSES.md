@@ -212,6 +212,11 @@ harness now runs J-H before any case that kills a node (`ffb63777`); that order 
 
 ## Owner decisions
 
+**Decided 2026-09-24:** item 1, the combined `0.36.2-patched.3` (ledger section 12), on Hiqlite
+`0.15.0-patched.2` from crates.io. Item 2, report first and then ship: the private report was
+filed through upstream's GitHub private vulnerability reporting before this branch was pushed.
+Item 3 is still open.
+
 1. **Next version: recommended, one combined `0.36.2-patched.3`.** The DPoP fix (F20), the
    `/health` storage signal (F21) and a rebuild on the repaired Hiqlite, once that is published
    under a new version. `0.36.2-patched.3` is unused (no tag, release or image tag). The earlier

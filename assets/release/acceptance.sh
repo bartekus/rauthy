@@ -778,6 +778,23 @@ else
   jassert "J-E: the restart is clean and keeps the candidate's row" $?
   stop_node "$JE"
 
+  # J-H. The supported way back (C-4): the archive taken before the upgrade, restored into a
+  # fresh volume, started by upstream. What was written after the upgrade is lost, as stated.
+  # It runs straight after J-E, before J-F and J-G kill nodes on these ports: a raft port a
+  # killed node held can stay unbindable for a while, and hiqlite 0.14 then panics with
+  # AddrInUse (seen against the published build, where J-G's refusal does not happen).
+  log "J-H. Rollback from the pre-upgrade archive into a fresh volume"
+  JH="$(j_case h "$JE/archive-before-upgrade")"
+  BIN="$UPSTREAM" start_node "$JH" $JP "${JENV[@]}"
+  wait_ready "$JH" 8099 60
+  jassert "J-H: upstream starts from the restored archive" $? "$(tail -3 "$JH/rauthy.log")"
+  [ "$(j_identity 8099)" = "$J_ID_UP" ] && group_exists 8099 j_written_by_upstream \
+    && ! group_exists 8099 j_written_by_the_candidate
+  jassert "J-H: the archive's state, without what the upgraded node wrote" $? "$(j_groups 8099)"
+  stop_node "$JH"
+  [ "$(cat "$JH/rc" 2>/dev/null)" = "0" ]
+  jassert "J-H: upstream stops cleanly" $? "exit $(cat "$JH/rc" 2>/dev/null)"
+
   # J-F. The candidate killed at each of Hiqlite's documented fault points (035 B-5).
   log "J-F. Interrupted consent moves"
   if [ "$J_EXPECT" = "published" ]; then
@@ -834,20 +851,6 @@ else
   [ "$(j_identity 8099)" = "$J_ID_UP" ] && group_exists 8099 j_written_by_upstream
   jassert "J-G: keys, users, clients and rows survive" $? "$(j_identity 8099)"
   stop_node "$JGS"
-
-  # J-H. The supported way back (C-4): the archive taken before the upgrade, restored into a
-  # fresh volume, started by upstream. What was written after the upgrade is lost, as stated.
-  log "J-H. Rollback from the pre-upgrade archive into a fresh volume"
-  JH="$(j_case h "$JE/archive-before-upgrade")"
-  BIN="$UPSTREAM" start_node "$JH" $JP "${JENV[@]}"
-  wait_ready "$JH" 8099 60
-  jassert "J-H: upstream starts from the restored archive" $? "$(tail -3 "$JH/rauthy.log")"
-  [ "$(j_identity 8099)" = "$J_ID_UP" ] && group_exists 8099 j_written_by_upstream \
-    && ! group_exists 8099 j_written_by_the_candidate
-  jassert "J-H: the archive's state, without what the upgraded node wrote" $? "$(j_groups 8099)"
-  stop_node "$JH"
-  [ "$(cat "$JH/rc" 2>/dev/null)" = "0" ]
-  jassert "J-H: upstream stops cleanly" $? "exit $(cat "$JH/rc" 2>/dev/null)"
 
   # J-I. Upstream started over the upgraded directory. Unsupported (C-4, Hiqlite B-4): recorded,
   # never passed or failed. It runs on its own copy, so nothing above depends on it.

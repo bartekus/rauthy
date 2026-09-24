@@ -10,9 +10,9 @@ Usage:
                                          an upstream package), not on where it resolves from
 
 Releasable means exactly one copy of each patched Hiqlite package, every one of them from the
-crates.io registry, none of upstream's own `hiqlite*` packages anywhere in the graph, and a single
-`openraft`. A second copy of any of these would compile and would split the storage types or the
-consensus implementation between two versions without anything saying so.
+crates.io registry and all at one version, none of upstream's own `hiqlite*` packages anywhere in
+the graph, and a single `openraft`. A second copy of any of these would compile and would split
+the storage types or the consensus implementation between two versions without anything saying so.
 
 One file for both workflows, so that the candidate and the publish run cannot disagree about what
 counts as the release graph.
@@ -59,6 +59,11 @@ def problems(pkgs, structure_only=False):
         copies = [p for p in hiq if p["name"] == name]
         if len(copies) != 1:
             found.append(f"{name}: {len(copies)} copies in the graph, expected exactly 1")
+    # The three are released together from one tree. Older hiqlite-patched manifests require
+    # their siblings with a caret, which also accepts a later `-patched.N` of either.
+    versions = {p["version"] for p in hiq if p["name"] in PATCHED}
+    if len(versions) > 1:
+        found.append(f"the patched packages resolve to different versions: {sorted(versions)}")
     raft = [p for p in pkgs if p["name"] == "openraft"]
     if len(raft) != 1:
         found.append(f"openraft: {len(raft)} copies in the graph, expected exactly 1")

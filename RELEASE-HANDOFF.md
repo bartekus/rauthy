@@ -54,7 +54,12 @@ supported by the upstream project, and carries upstream's licence and authorship
    never restored.
 5. **A refusal says what it created** (`hiqlite-owner.lock`, and the data directory if it was
    absent) instead of "Nothing was changed.". No data file is moved or written.
-6. **WAL locks** are held from before the first write until the last one, and their files are
+6. **A restart after an unclean stop no longer re-bootstraps the database.** Startup waits until
+   the rebuilt state machine has applied its whole log before it reads anything. Before, a start
+   could see an empty database for a few milliseconds and run the first-boot bootstrap again:
+   the initial admin reset from the bootstrap values and a second signing key set generated
+   (both sets published). Affects `0.36.2-patched.2`; upstream has the same startup path but was not tested for it.
+7. **WAL locks** are held from before the first write until the last one, and their files are
    removed at a clean stop.
 
 ## Status of the six corrections to `0.36.2-patched.2`

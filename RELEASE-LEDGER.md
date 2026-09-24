@@ -698,6 +698,7 @@ three Hiqlite packages and the workspace's own version, `Cargo.lock` is unchange
 | | new leg V: upgrade from the published `0.36.2-patched.2` image, then this build without and with the variable | |
 | | the candidate workflow builds a test-only fault-point binary per architecture (artifact `fault-build-<arch>`, outside the publish workflow's `rauthy-*` pattern) and passes it to leg J; it extracts the previous release's binary from its pinned image for leg V | |
 | | `check_graph.py` refuses patched packages at different versions | |
+| F22 | startup waits for the rebuilt state machine to apply its log before reading it | 12.5 |
 
 ### 12.4 Evidence before the pull request
 
@@ -711,3 +712,22 @@ three Hiqlite packages and the workspace's own version, `Cargo.lock` is unchange
 Leg V, the fault-point build in CI and native amd64 have not run before the pull request. The
 qualifying evidence is the candidate run on the merge commit, as in section 7.
 
+### 12.5 F22: a restart after an unclean stop bootstrapped a live database again
+
+Found by the merge-commit candidate `35977264343` (acceptance arm64, leg Q), which therefore does
+not qualify publication; amd64 and the PR head's run `35969384185` passed the same leg. After a
+SIGKILL, Hiqlite's `auto-heal` rebuilds the state machine from the Raft log. The node reports
+healthy once it is leader, before the replay has applied anything (`last_applied=None`, 191
+entries), and Rauthy's startup reads the database at once: `migrate_init_prod` found `jwks` empty
+7 ms after the election, deleted the initial admin and client rows, reset the admin from the
+bootstrap values and generated a second key set. The replay then restored the old rows beside the
+new ones. Nothing in Hiqlite `0.15.0-patched.2` touched this path; it is a race that predates this
+release.
+
+Fix: `DB::init_after_start` waits, on a leader, until `last_applied` reaches the log's last index
+before startup reads anything (checking for a terminal failure while it waits). Local evidence,
+macOS arm64 debug, 200 writes, SIGKILL, restart: with the fix, two of three restarts logged
+"Waiting for the Raft DB to apply its log: None of 222" and read only after the replay; the unfixed
+build did not lose the race in four tries on this host. Leg Q now also asserts that the restart
+does not bootstrap its database. The proper place for the guarantee is Hiqlite's health (or its
+start) not reporting ready before the replay; that is a follow-up there.

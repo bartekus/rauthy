@@ -120,6 +120,38 @@ impl DB {
                 sleep(Duration::from_secs(1)).await;
                 metrics = client.metrics_db().await?;
             }
+
+            // Healthy only means a leader exists. After an unclean stop, `auto-heal` rebuilds
+            // the state machine by replaying the Raft log, and until that replay reaches the end
+            // of the log, local reads see a partial database. Startup reads it right away: an
+            // empty `jwks` table makes `migrate_init_prod` bootstrap a live database again. A
+            // leader's whole log is committed, so wait until it has all been applied.
+            if metrics.state.is_leader()
+                && let Some(target) = metrics.last_log_index
+            {
+                let mut waited = 0u32;
+                while metrics.last_applied.map(|id| id.index) < Some(target) {
+                    if let Some(failure) = client.node_failure() {
+                        error!(
+                            "The database layer failed while applying its log: {}",
+                            failure.message()
+                        );
+                        return Err(ErrorResponse::new(
+                            ErrorResponseType::Database,
+                            "The database layer failed while applying its log",
+                        ));
+                    }
+                    if waited.is_multiple_of(100) {
+                        info!(
+                            "Waiting for the Raft DB to apply its log: {:?} of {target}",
+                            metrics.last_applied.map(|id| id.index)
+                        );
+                    }
+                    waited += 1;
+                    sleep(Duration::from_millis(100)).await;
+                    metrics = client.metrics_db().await?;
+                }
+            }
             Ok(())
         }
     }

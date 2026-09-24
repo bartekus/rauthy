@@ -599,3 +599,45 @@ of F20), a flake risk in leg U's single read (now polled), missing skip entries 
 inaccurate restore-scope sentence and an understated `jwks_cleanup` observation (both corrected
 in the inventory). This review does not replace the human review `AGENTS.md` requires before a
 pull request.
+
+### 11.6 Candidate integration on the repaired Hiqlite (2026-09-24, unpublished)
+
+On the local branch `integ/0.36.2-patched.3-hq035`, cut from `51e73280`, which stays the reviewed
+head of `work/0.36.2-patched.3`. **A candidate, not registry-published and not qualified.** The
+integration commit `004d537f` points the workspace at Hiqlite `26e2fa0a` (PR #37, repair
+`048fcecd`) from git; it must never be merged or released. Identities, binaries, the leg J
+results and their limits are in `RELEASE-PRODUCER-RESPONSES.md`, "The repaired Hiqlite".
+
+| check | where | tree | result |
+|---|---|---|---|
+| `cargo fmt --all --check`, `cargo clippy --workspace --locked -- -D warnings` | macOS arm64 | `004d537f` | clean |
+| workspace unit tests (`--lib`) | macOS arm64 | `004d537f` | 88 passed, 0 failed, 3 ignored |
+| integration suite, Hiqlite backend | macOS arm64, debug | `004d537f` | see below |
+| leg J, candidate, strict, stop on first failure | native Linux arm64, release | harness `2468da7f`, binary `fd745715` | 94 passed, 0 failed, 0 skipped, 2 min 25 s |
+| leg J, negative control on published `0.36.2-patched.2` | native Linux arm64 | harness `2468da7f`, binary `5e498c31` | all 6 declared controls fail, 2 min 39 s |
+| the same on native Linux amd64, the other legs, Rahi's suite | | | **not executed** |
+
+The first Hiqlite-backend suite run stopped inside `zzg_handler_token_exchange`, whose process
+was sampled after 12 minutes with every sample in the dynamic loader (`_dyld_start`): it never
+reached `main`, on a host loaded by other builds. It had passed every test before that (41 passed,
+0 failed). The run was repeated once after that diagnosis; both logs are kept.
+
+`check_graph.py` refuses this graph (git sources, no registry checksums), which is what it is for.
+Before anything leaves this machine the dependency is replaced by the published packages under a
+new version, the graph is regenerated and inspected with `check_graph.py`, and the release is
+rebuilt. The internal-caret caveat of `0.15.0-patched.1` carries into that step:
+`hiqlite-patched` requires its siblings `hiqlite-wal-patched` and `hiqlite-derive-patched` with a
+caret (`version = "0.15.0-patched.1"`, no `=`), and the candidate keeps that form. Cargo can
+therefore pair one release of `hiqlite-patched` with a later sibling release. `check_graph.py`
+requires exactly one copy of each but not the same version for all three, so the regenerated
+lock has to be read for that as well, or the check extended.
+
+### 11.7 Corrections to section 11's own proposals
+
+- The correction notice is now self-contained: `patched/0.36.2` on GitHub is still at `513bcc98`
+  and does not carry the corrections it pointed to.
+- The restore-invalidation proposal (`RELEASE-STATE-INVENTORY.md` section 4) wrote its
+  completion row before clearing the cache and keyed completion on a row existing. A crash
+  between the two, or a backup carrying an earlier run's row, would have let a restored instance
+  serve a stale cached session. It now runs by operation id through durable phases. Not
+  implemented.

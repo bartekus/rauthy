@@ -86,32 +86,61 @@ Nothing else in the cache can be exported or imported.
 
 ## 4. Proposed: invalidation before a restored instance serves
 
-Proposal only. Not implemented; it waits for the owner's acceptance of the policy.
+Proposal only. Not implemented, and nothing below is implemented without the owner's separate
+policy authorization: no restore API, no migration, no startup gate.
 
-- **Shape.** A CLI subcommand, `rauthy restore-invalidate`, run against the data directory with
-  the same configuration as `serve`, which starts the storage layer with no listener and exits.
-  Not an HTTP endpoint: its purpose is to finish before anything can be served, and an endpoint
-  would exist on every serving node. Hiqlite always binds its raft and API listeners (Hiqlite 035
-  section 3), so it runs with `HQL_NODES` bound to loopback on the one node.
-- **What it invalidates, in one SQL transaction per backend:** every session (`exp` set to now);
-  every row of `refresh_tokens` and `refresh_tokens_devices` deleted; every `issued_tokens` row
-  revoked; every unused magic link expired. Then the whole cache is cleared, counters included,
-  so that no cached session or user survives it.
-- **What it records.** A row in a new table (hence a migration) holding the run's start and end,
-  the backup name the operator passed, and the counts; one `events` entry; the same on stdout.
-- **Idempotence and crash recovery.** Every statement is an absolute assignment, so a second run
-  changes nothing further and a run killed before its commit left nothing. The table row is
-  written in the same transaction; its absence is how the next `serve` knows the step did not
-  complete, and `serve` then refuses to start until it has run (only when the operator armed it,
-  for example with `RESTORE_REQUIRES_INVALIDATION=true`, so that nothing changes for others).
+**Correction to the first draft of this section.** It wrote the completion row in the same SQL
+transaction as the invalidation and cleared the cache afterwards. A crash between the two leaves
+a completion row beside a cache that may still hold a restored session, and `Session::find`
+(`src/data/src/entity/sessions.rs`) reads the cache before SQL, so a gate that trusts the row
+would let a stale session serve. It also keyed completion on "a row exists", which a later
+backup taken after an earlier run carries with it: a prior run's completion would satisfy a new
+restore. The sequence below replaces it.
+
+- **Identity.** Each restore gets its own operation id, supplied from outside the restored data
+  (the operator or Rahi generates it for this restore and passes it to both commands, for
+  example `RESTORE_INVALIDATION_ID`). It cannot come from the database: a backup restores
+  whatever rows it held, including a completed row of an earlier restore.
+- **Phases, each durable before the next starts,** in a new table (hence a migration) keyed by
+  the id: `in_progress` (inserted in its own transaction, with the backup name and start time);
+  `sql_done` (the invalidation below, and the state change, in one transaction); `cache_done`
+  (written only after the whole cache clear has returned); `activated` (written by `serve`, below).
+- **SQL invalidation, idempotent:** every session's `exp` set to now; every `refresh_tokens` row
+  deleted; every `refresh_tokens_devices` row expired (the existing bulk path leaves these, see
+  section 3); every `issued_tokens` row revoked; every unused magic link expired. Absolute
+  assignments only, so a rerun after a crash changes nothing further.
+- **Cache invalidation, idempotent:** every cache cleared, counters included. A crash after
+  `sql_done` and before `cache_done` is resumed by clearing again; a crash after the clear and
+  before its state write clears a second time, which is harmless.
+- **Resume rule.** A run given an id resumes from that id's recorded phase and never skips one.
+  A run given a new id starts at `in_progress`, whatever other ids the table holds.
+- **Activation.** With `RESTORE_REQUIRES_INVALIDATION=true` (armed by the operator for a restored
+  instance, so that nothing changes for anyone else), `serve` checks after `DB::init` and before
+  it binds the HTTP listener or spawns any scheduler: it refuses, through the storage shutdown,
+  unless the table holds the configured id at `cache_done` or `activated`, then records
+  `activated`, and only then serves.
+- **What is not closed, stated plainly.** The invalidation runs in a command that starts the
+  storage layer and spawns no HTTP listener and no scheduler. Hiqlite still binds its raft and
+  API listeners (Hiqlite 035 section 3: there is no start without them); bound to loopback at
+  N = 1, they accept only requests carrying the cluster's raft or API secret, and nothing
+  authorized should hold those during a restore. That is an operator precondition, not a fence.
+  A second process on the directory is excluded by Hiqlite's owner lock, not by this sequence.
 - **Authorization.** Access to the data directory and the configuration, as for `serve`.
-- **Not reversed by it, and left to the operator:** users, clients, groups, roles, scopes,
-  providers and API keys as they stood at the backup (disabled ones enabled again, deleted ones
-  back, new ones gone); client secrets and password hashes as they were; signing keys as they
-  were (see 5); outstanding access tokens issued before the restore, which stay valid at every
-  relying party until they expire; and every cache-only item in section 2.
-- **Signing keys**, optionally: a rotation after the invalidation, so that tokens minted after
-  the backup do not validate against the restored keys. See section 5 for what that does not do.
+- **Not reversed by it, and each needing its own reconciliation:** users, clients, groups,
+  roles, scopes, providers and API keys as they stood at the backup (disabled ones enabled again,
+  deleted ones back, new ones gone); client secrets and password hashes as they were; signing
+  keys as they were (section 5: a rotation does not remove a public key a relying party has
+  already cached); outstanding access tokens issued before the restore, which stay valid at every
+  relying party until they expire; and every cache-only item in section 2. A consumer's
+  access-token floor does not cover any of these: a revived refresh credential mints a new token
+  that is newer than any floor.
+- **Kill-point tests, prepared and not run.** One pass each, 60 s per case, 10 minutes for the
+  set, stop at the first failure: a kill after `in_progress`; inside the SQL transaction; after
+  `sql_done`; after the cache clear and before `cache_done`; after `cache_done` and before
+  `activated`. After each, `serve` with the id refuses, a rerun with the id completes, and then a
+  restored session, a restored refresh token and a restored device refresh token are each refused.
+  Two identity cases: a completed row for a different id, present in the table or carried in by
+  the restored backup, does not satisfy the gate.
 
 ## 5. Signing-key rotation
 

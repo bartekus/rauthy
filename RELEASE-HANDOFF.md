@@ -4,6 +4,11 @@ For the session that adopts this build in `rahi`. The evidence is in `RELEASE-LE
 12 for this release); this file is what a consumer needs to act. Pin from the release's own
 `RELEASE-PROVENANCE.md`, which the publish run writes from what it actually published.
 
+> **Published 2026-09-24.** Release https://github.com/bartekus/rauthy/releases/tag/v0.36.2-patched.3,
+> tag `v0.36.2-patched.3` at `da8fb522a000fcfc44bbb70bd45e3500185de804`. Pin:
+> `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.3@sha256:d75cac0f708f3e238c458b622fea2f0b7dda9b67e9435eeafa37698d88a2a3c8`.
+> Per-platform digests, checksums and runs: ledger section 12.6.
+
 > **Never pin `0.36.2-patched.1`.** An image with that tag exists in the registry from a publish
 > run whose arm64 verification failed on a harness defect; it was never released and has no
 > provenance. The ledger's section 7 has the account.
@@ -84,7 +89,7 @@ only requires a `@sha256:` pin.
 `docker/Dockerfile:12` and `docker/runtime.Dockerfile:22` become:
 
 ```dockerfile
-ARG RAUTHY_IMAGE=ghcr.io/bartekus/rauthy-patched:0.36.2-patched.3@sha256:<index digest from RELEASE-PROVENANCE.md>
+ARG RAUTHY_IMAGE=ghcr.io/bartekus/rauthy-patched:0.36.2-patched.3@sha256:d75cac0f708f3e238c458b622fea2f0b7dda9b67e9435eeafa37698d88a2a3c8
 ```
 
 Update the comment above the line in `docker/Dockerfile` to name the patched build and its

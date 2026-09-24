@@ -612,7 +612,8 @@ results and their limits are in `RELEASE-PRODUCER-RESPONSES.md`, "The repaired H
 |---|---|---|---|
 | `cargo fmt --all --check`, `cargo clippy --workspace --locked -- -D warnings` | macOS arm64 | `004d537f` | clean |
 | workspace unit tests (`--lib`) | macOS arm64 | `004d537f` | 88 passed, 0 failed, 3 ignored |
-| integration suite, Hiqlite backend | macOS arm64, debug | `004d537f` | see below |
+| integration suite, Hiqlite backend | macOS arm64, debug | `004d537f` | 131 passed, 0 failed, 5 ignored (second run, below) |
+| integration suite, Postgres backend | macOS arm64, debug, Postgres 17.2 | `004d537f` | 131 passed, 0 failed, 5 ignored |
 | leg J, candidate, strict, stop on first failure | native Linux arm64, release | harness `2468da7f`, binary `fd745715` | 94 passed, 0 failed, 0 skipped, 2 min 25 s |
 | leg J, negative control on published `0.36.2-patched.2` | native Linux arm64 | harness `2468da7f`, binary `5e498c31` | all 6 declared controls fail, 2 min 39 s |
 | the same on native Linux amd64, the other legs, Rahi's suite | | | **not executed** |

@@ -21,7 +21,19 @@ static STORAGE_READY: AtomicBool = AtomicBool::new(true);
 /// component, so there is nothing to debounce and no reason to keep routing to the node meanwhile.
 #[inline]
 pub fn storage_ready() -> bool {
-    STORAGE_READY.load(Ordering::Relaxed) && DB::hql().node_failure().is_none()
+    STORAGE_READY.load(Ordering::Relaxed) && !storage_terminal()
+}
+
+/// Whether the embedded Hiqlite node has recorded a terminal failure.
+///
+/// Hiqlite's own lifecycle record, not an inference from failed requests: it is set once, never
+/// cleared while this process lives, and reading it touches no storage, so it is answerable at
+/// any time, including inside `HEALTH_CHECK_DELAY_SECS` and on a node that refuses everything
+/// else. With the Postgres backend it still describes the embedded node that holds the cache; a
+/// Postgres failure never sets it.
+#[inline]
+pub fn storage_terminal() -> bool {
+    DB::hql().node_failure().is_some()
 }
 
 pub async fn watch_health() {

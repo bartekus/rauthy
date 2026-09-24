@@ -8,7 +8,7 @@ use cryptr::EncKeys;
 use rauthy_api_types::generic::{
     AppVersionResponse, Argon2ParamsResponse, EncKeyMigrateRequest, EncKeysResponse,
     HealthResponse, I18nConfigResponse, LoginTimeResponse, PasswordHashTimesRequest,
-    PasswordPolicyRequest, PasswordPolicyResponse, SearchParams, SearchParamsType,
+    PasswordPolicyRequest, PasswordPolicyResponse, SearchParams, SearchParamsType, StorageState,
 };
 use rauthy_common::compression::compress_br;
 use rauthy_common::constants::{
@@ -26,7 +26,7 @@ use rauthy_data::entity::pow::PowEntity;
 use rauthy_data::entity::sessions::Session;
 use rauthy_data::entity::users::User;
 use rauthy_data::events::event::Event;
-use rauthy_data::events::health_watch::storage_ready;
+use rauthy_data::events::health_watch::{storage_ready, storage_terminal};
 use rauthy_data::ipgeo;
 use rauthy_data::language::Language;
 use rauthy_data::rauthy_config::RauthyConfig;
@@ -453,16 +453,32 @@ pub async fn post_update_language(
 /// Backend health state
 ///
 /// Health endpoint to get some additional information about the backend status, if it exists.
+///
+/// `storage` is `terminal` once the embedded Hiqlite node is out of service, which lasts until
+/// the process is restarted and is reported inside `HEALTH_CHECK_DELAY_SECS` as well. Inside that
+/// window a node that is not terminal is not checked: it reports both layers healthy, as before,
+/// and `storage` is `unknown`. Afterwards each request checks both layers and reports `ok` or
+/// `degraded`.
 #[utoipa::path(
     get,
     path = "/health",
     tag = "health",
     responses(
         (status = 200, description = "Ok", body = HealthResponse),
+        (status = 500, description = "A storage layer is unhealthy", body = HealthResponse),
     ),
 )]
 #[get("/health")]
 pub async fn get_health() -> impl Responder {
+    // Answered before anything else, and without a storage operation: every one would be refused.
+    if storage_terminal() {
+        return HttpResponse::InternalServerError().json(HealthResponse {
+            db_healthy: false,
+            cache_healthy: false,
+            storage: StorageState::Terminal,
+        });
+    }
+
     if Utc::now().sub(*APP_START).num_seconds()
         < RauthyConfig::get().vars.database.health_check_delay_secs as i64
     {
@@ -470,20 +486,34 @@ pub async fn get_health() -> impl Responder {
         HttpResponse::Ok().json(HealthResponse {
             db_healthy: true,
             cache_healthy: true,
+            storage: StorageState::Unknown,
         })
     } else {
         let db_healthy = is_db_alive().await;
         let cache_healthy = DB::hql().is_healthy_cache().await.is_ok();
 
-        let body = HealthResponse {
-            db_healthy,
-            cache_healthy,
-        };
+        // Read again after the check, which may itself have met the failure: once it is
+        // recorded, no answer may report anything else.
+        if storage_terminal() {
+            return HttpResponse::InternalServerError().json(HealthResponse {
+                db_healthy: false,
+                cache_healthy: false,
+                storage: StorageState::Terminal,
+            });
+        }
 
         if db_healthy && cache_healthy {
-            HttpResponse::Ok().json(body)
+            HttpResponse::Ok().json(HealthResponse {
+                db_healthy,
+                cache_healthy,
+                storage: StorageState::Ok,
+            })
         } else {
-            HttpResponse::InternalServerError().json(body)
+            HttpResponse::InternalServerError().json(HealthResponse {
+                db_healthy,
+                cache_healthy,
+                storage: StorageState::Degraded,
+            })
         }
     }
 }

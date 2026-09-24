@@ -384,6 +384,7 @@ use utoipa::{OpenApi, openapi};
             EncKeysResponse,
             GroupResponse,
             HealthResponse,
+            StorageState,
             I18nConfigResponse,
             JWKSCerts,
             JWKSPublicKeyCerts,

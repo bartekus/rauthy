@@ -1,11 +1,12 @@
-# Release ledger: Rauthy 0.36.2-patched.2
+# Release ledger: Rauthy 0.36.2-patched.2 and 0.36.2-patched.3
 
 A downstream patched distribution of Rauthy. **Not an upstream release**, not endorsed by and not
 supported by the upstream project. Upstream's sources, licence and authorship are carried
 unchanged apart from the commits listed below.
 
-This file states facts that were measured, and says where a value does not exist yet. Section 7
-is the publication state; it is the section to read first. The copy attached to a release is the
+This file states facts that were measured, and says where a value does not exist yet. Sections 1
+to 10 are the record of `0.36.2-patched.2`, and section 7 is its publication state. Section 11 is
+the work after it; **section 12 is `0.36.2-patched.3`**, and the section to read first for it. The copy attached to a release is the
 one in the tagged tree, written before the publish run existed: the artefact digests are in that
 release's `RELEASE-PROVENANCE.md`, and the ledger on `patched/0.36.2` records them afterwards.
 
@@ -526,3 +527,187 @@ to the Hiqlite fork's own record.
 This line tracks upstream `v0.36.x`. An upstream patch release becomes `0.36.<z>-patched.1` on a new
 `release/` branch cut from that tag, with this ledger and the acceptance matrix re-run in full.
 Patch levels within one base increment. Published tags never move.
+
+## 11. After publication: corrections and the next patch level (released as patched.3, section 12)
+
+Recorded 2026-09-23 on the local branch `work/0.36.2-patched.3`, cut from `patched/0.36.2` at
+`513bcc98`. **Nothing in this section is released, pushed or qualified.** Sections 1 to 10 stay
+the record of `0.36.2-patched.2` and are not edited.
+
+### 11.1 Corrections to the published handoff
+
+`RELEASE-HANDOFF.md` keeps the text that shipped and marks six statements **[C-1]** to **[C-6]**
+under a dated corrections section. The evidence each correction rests on:
+
+| | corrects | evidence |
+|---|---|---|
+| C-1 | persistent `503` as a restart signal | `/ready` has one `503` for every unconfirmed sample (`health_watch.rs::storage_ready`); Rahi 043 rejects the heuristic |
+| C-2 | `StorageInUse` "before anything is touched" | only patched builds take the owner lock; Rahi 043 D-P3, Hiqlite F-126 and 035 P-2 (the live node's cache moved, then damaged) |
+| C-3 | "Nothing was changed." | `hiqlite-owner.lock` created (Rahi D-P2, Hiqlite 035 P-1); published `start.rs` checks the cache before opening SQLite, so the checkpoint in section 5 belongs to an earlier tree |
+| C-4 | the manual-move rollback | leg J ran with no Raft snapshot (section 5, limits); Hiqlite F-129 and 035 P-6 (3 of 3 panics without the move); 035 B-4 |
+| C-5 | "a no-op once the marker exists", "leave it set" | Hiqlite F-130 (defect, medium confidence, source-read); 035 B-5 unreleased; Hiqlite's third-pass notice on the lingering variable |
+| C-6 | "a restart window already tolerates", "nothing missing" | `server.rs::run` clears only `Html` and `App` in a release build; `RELEASE-STATE-INVENTORY.md` |
+
+A notice for the published release, changing none of its assets, is prepared in
+`RELEASE-CORRECTION-NOTICE-0.36.2-patched.2.md` and awaits approval.
+
+### 11.2 Release assets, re-verified
+
+Anonymous reads at 2026-09-23T20:38:05Z: eight assets on release `394484695`, each matching
+GitHub's recorded digest; the handoff, ledger and licence assets identical to the tagged tree;
+the tag at `17132b94`; the registry index `sha256:ea114a8b...c0d0c52478` with the two platform
+manifests of section 7; `/app/rauthy` per platform hashing to `SHA256SUMS` and printing
+`rauthy 0.36.2-patched.2`. Detail in `RELEASE-PRODUCER-RESPONSES.md`, R-3.
+
+### 11.3 Changes on the branch
+
+| # | change | commit |
+|---|---|---|
+| F20 | DPoP: a nonce is accepted only when the cache holds an entry whose own value it is and whose expiry is in the future; `get_latest` issues a new nonce when fewer than 15 s remain | `40187dbe` |
+| F21 | `/health` gains `storage`: `ok`, `degraded`, `terminal` (Hiqlite's `node_failure()`), `unknown` (inside `HEALTH_CHECK_DELAY_SECS`); acceptance K and P extended, leg U added | `d9ec502a` |
+| | documentation: the corrections, `RELEASE-STATE-INVENTORY.md`, `RELEASE-PRODUCER-RESPONSES.md` | `d7d087aa` and later |
+
+F20 was observed failing without the fix: against a local backend, `/oidc/token` answered `200`
+with a token to a proof carrying a nonce the server never issued. Whether and how it is disclosed
+before this branch leaves the machine is an owner decision (`RELEASE-PRODUCER-RESPONSES.md`).
+
+### 11.4 Local evidence
+
+| check | where | tree | result |
+|---|---|---|---|
+| `cargo fmt --all --check`, `cargo clippy --workspace -- -D warnings` | macOS arm64 | `d7d087aa` | clean |
+| workspace unit tests (`--lib`) | macOS arm64 | `d7d087aa` | 88 passed, 0 failed |
+| integration suite, Hiqlite backend | macOS arm64, debug | `d7d087aa` | 131 passed, 0 failed, 5 ignored |
+| integration suite, Postgres backend | macOS arm64, debug, Postgres 17.2 | `d7d087aa` | 131 passed, 0 failed, 5 ignored |
+| acceptance K, P, U only, strict | **native Linux arm64**, release build in `rust:1.95.0-bookworm`, binary `968207a6...5816` | `d7d087aa` | 36 passed, 0 failed, 0 skipped, 3 min 54 s |
+| the same | native Linux amd64 | | **not executed**: no native amd64 host |
+
+The Linux arm64 leg ran twice. The first run (24 passed, 12 failed) kept its data directories on
+a macOS bind mount, where `chmod a-w` is not enforced, so leg P's injection never reached the
+writer (3000 writes accepted). Probed separately: a write into a read-only directory succeeds on
+that mount and is refused on the container's own filesystem. The second run kept them on the
+container filesystem and changed nothing else. Both runs' logs are kept.
+
+None of this is release qualification: the full acceptance matrix, both native architectures,
+the registry-only graph and Rahi's suite run in the candidate workflow on the pull request, and
+section 7's sequence applies.
+
+### 11.5 Independent review
+
+A local reviewer read the three commits at `bb803f27`: no defect in the fixes; blocking only
+because this section did not yet exist. It also found `get_latest`'s inverted margin (now part
+of F20), a flake risk in leg U's single read (now polled), missing skip entries in leg K, an
+inaccurate restore-scope sentence and an understated `jwks_cleanup` observation (both corrected
+in the inventory). This review does not replace the human review `AGENTS.md` requires before a
+pull request.
+
+### 11.6 Candidate integration on the repaired Hiqlite (2026-09-24, unpublished)
+
+On the local branch `integ/0.36.2-patched.3-hq035`, cut from `51e73280`, which stays the reviewed
+head of `work/0.36.2-patched.3`. **A candidate, not registry-published and not qualified.** The
+integration commit `004d537f` points the workspace at Hiqlite `26e2fa0a` (PR #37, repair
+`048fcecd`) from git; it must never be merged or released. Identities, binaries, the leg J
+results and their limits are in `RELEASE-PRODUCER-RESPONSES.md`, "The repaired Hiqlite".
+
+| check | where | tree | result |
+|---|---|---|---|
+| `cargo fmt --all --check`, `cargo clippy --workspace --locked -- -D warnings` | macOS arm64 | `004d537f` | clean |
+| workspace unit tests (`--lib`) | macOS arm64 | `004d537f` | 88 passed, 0 failed, 3 ignored |
+| integration suite, Hiqlite backend | macOS arm64, debug | `004d537f` | 131 passed, 0 failed, 5 ignored (second run, below) |
+| integration suite, Postgres backend | macOS arm64, debug, Postgres 17.2 | `004d537f` | 131 passed, 0 failed, 5 ignored |
+| leg J, candidate, strict, stop on first failure | native Linux arm64, release | harness `2468da7f`, binary `fd745715` | 94 passed, 0 failed, 0 skipped, 2 min 25 s |
+| leg J, negative control on published `0.36.2-patched.2` | native Linux arm64 | harness `2468da7f`, binary `5e498c31` | all 6 declared controls fail, 2 min 39 s |
+| the same on native Linux amd64, the other legs, Rahi's suite | | | **not executed** |
+
+The first Hiqlite-backend suite run stopped inside `zzg_handler_token_exchange`, whose process
+was sampled after 12 minutes with every sample in the dynamic loader (`_dyld_start`): it never
+reached `main`, on a host loaded by other builds. It had passed every test before that (41 passed,
+0 failed). The run was repeated once after that diagnosis; both logs are kept.
+
+`check_graph.py` refuses this graph (git sources, no registry checksums), which is what it is for.
+Before anything leaves this machine the dependency is replaced by the published packages under a
+new version, the graph is regenerated and inspected with `check_graph.py`, and the release is
+rebuilt. The internal-caret caveat of `0.15.0-patched.1` carries into that step:
+`hiqlite-patched` requires its siblings `hiqlite-wal-patched` and `hiqlite-derive-patched` with a
+caret (`version = "0.15.0-patched.1"`, no `=`), and the candidate keeps that form. Cargo can
+therefore pair one release of `hiqlite-patched` with a later sibling release. `check_graph.py`
+requires exactly one copy of each but not the same version for all three, so the regenerated
+lock has to be read for that as well, or the check extended.
+
+### 11.7 Corrections to section 11's own proposals
+
+- The correction notice is now self-contained: `patched/0.36.2` on GitHub is still at `513bcc98`
+  and does not carry the corrections it pointed to.
+- The restore-invalidation proposal (`RELEASE-STATE-INVENTORY.md` section 4) wrote its
+  completion row before clearing the cache and keyed completion on a row existing. A crash
+  between the two, or a backup carrying an earlier run's row, would have let a restored instance
+  serve a stale cached session. It now runs by operation id through durable phases. Not
+  implemented.
+
+**Independent review of `51e73280..b4adba04`** (local reviewer, 2026-09-24): `VERDICT: no
+blocking findings`. Acted on: J-E's "the ban is gone" could pass on a failed read (it now
+requires a `200`); `J_EXPECT` is validated; the notice now also states Rauthy's own observation
+of upstream over an upgraded directory. Recorded, required before the harness reaches a branch
+CI runs: `release-candidate.yaml` does not build a fault-point binary or set `RAUTHY_FAULT`, so a
+strict run would skip J-F and fail; and leg J's default expectations fail on any build still on
+`0.15.0-patched.1`, so the harness change belongs only with the repin. These fixes follow the
+recorded runs and have not been run.
+
+## 12. `0.36.2-patched.3`
+
+Prepared 2026-09-24 on `release/0.36.2-patched.3`, cut from `patched/0.36.2` at `513bcc98`. The
+owner chose one combined release (section 11, "Owner decisions" in
+`RELEASE-PRODUCER-RESPONSES.md`): F20, F21 and the rebuild on the repaired Hiqlite.
+
+### 12.1 Identity
+
+| | |
+|---|---|
+| Version | `0.36.2-patched.3` |
+| Upstream base | `v0.36.2` = `dd61ac3c84d6b238108dc8438b53043b5177a662` |
+| Storage dependency | `hiqlite-patched`, `hiqlite-wal-patched`, `hiqlite-derive-patched` `=0.15.0-patched.2`, crates.io |
+| Image | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.3` |
+| Supported topology | N = 1 |
+| Publication status | **not published**. Digests, runs and the tag are recorded here after the publish run, as in section 7 |
+
+### 12.2 Dependency graph
+
+| package | version | checksum (crates.io) |
+|---|---|---|
+| `hiqlite-patched` | `0.15.0-patched.2` | `67ae1ca7cd5c601fc0176f5e6e15dfc480b088b048ed9d482add288f655c229d` |
+| `hiqlite-wal-patched` | `0.15.0-patched.2` | `d65dd8c35c40f8204c64c62a549614da93078e12d290e7db48937bc6c828d290` |
+| `hiqlite-derive-patched` | `0.15.0-patched.2` | `ce54d2189eadd47c368537b9a6687afef94df64a1eed0ae192614f350a57f2e2` |
+| `openraft` | `0.9.25` | unchanged |
+
+Hiqlite `0.15.0-patched.2` is tag `v0.15.0-patched.2` at `5c2cdef6` on `bartekus/hiqlite`. Its crate
+sources are identical to `26e2fa0a`, the candidate section 11.6 tested from git: `git diff
+26e2fa0a v0.15.0-patched.2` touches no `.rs` file, only the three versions, the README, and the
+sibling requirements, which are now exact (`=0.15.0-patched.2`). That closes the caret caveat of
+11.6 for this graph, and `check_graph.py` now also refuses patched packages at different versions
+(checked against a lock with the WAL crate edited to a later version: refused). Apart from the
+three Hiqlite packages and the workspace's own version, `Cargo.lock` is unchanged.
+
+### 12.3 Changes against `0.36.2-patched.2`
+
+| # | change | where |
+|---|---|---|
+| F20 | DPoP nonce enforcement and renewal margin | 11.3. Reported privately to the upstream maintainer before this branch was pushed (GitHub private vulnerability reporting, 2026-09-24) |
+| F21 | `/health` `storage` | 11.3 |
+| H-2 | Hiqlite `0.15.0-patched.2`: live-node exclusion before any rename, resumable consent move, refusals that name what they created, WAL locks held to the last write | 12.2 |
+| | leg J rewritten for H-2 against the real upstream `v0.36.2`, including J-F's seven interruption points | 11.6 |
+| | new leg V: upgrade from the published `0.36.2-patched.2` image, then this build without and with the variable | |
+| | the candidate workflow builds a test-only fault-point binary per architecture (artifact `fault-build-<arch>`, outside the publish workflow's `rauthy-*` pattern) and passes it to leg J; it extracts the previous release's binary from its pinned image for leg V | |
+| | `check_graph.py` refuses patched packages at different versions | |
+
+### 12.4 Evidence before the pull request
+
+| check | where | tree | result |
+|---|---|---|---|
+| `cargo fmt --all --check`, `cargo clippy --workspace --locked -- -D warnings` | macOS arm64 | this branch | clean |
+| workspace unit tests (`--lib`) | macOS arm64 | this branch | 88 passed, 0 failed |
+| `check_graph.py Cargo.lock` | | this branch | release graph |
+| integration suites, leg J | | `26e2fa0a` from git | 11.6; same crate sources |
+
+Leg V, the fault-point build in CI and native amd64 have not run before the pull request. The
+qualifying evidence is the candidate run on the merge commit, as in section 7.
+

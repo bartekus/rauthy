@@ -108,6 +108,13 @@ async fn test_get_ready_and_health() -> Result<(), Box<dyn Error>> {
     let body: serde_json::Value = res.json().await?;
     assert_eq!(body["db_healthy"], serde_json::Value::Bool(true));
     assert_eq!(body["cache_healthy"], serde_json::Value::Bool(true));
+    // `unknown` while the backend is inside HEALTH_CHECK_DELAY_SECS, `ok` after it; the failure
+    // states are asserted by release acceptance legs K, P and U against real faults
+    let storage = body["storage"].as_str().unwrap_or_default();
+    assert!(
+        storage == "ok" || storage == "unknown",
+        "storage: {storage}"
+    );
 
     Ok(())
 }

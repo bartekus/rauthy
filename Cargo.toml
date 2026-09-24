@@ -4,7 +4,7 @@ members = ["src/*"]
 exclude = ["rauthy-client"]
 
 [workspace.package]
-version = "0.36.2-patched.2"
+version = "0.36.2-patched.3"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Sebastian Dobe <sebastiandobe@mailbox.org>"]
@@ -106,7 +106,7 @@ futures-util = "0.3"
 gethostname = "1"
 hex = { version = "0.4", features = ["serde"] }
 hickory-resolver = "0.26.1"
-hiqlite = { package = "hiqlite-patched", version = "=0.15.0-patched.1", features = [
+hiqlite = { package = "hiqlite-patched", version = "=0.15.0-patched.2", features = [
     "cache", "cast_ints", "counters", "dashboard", "listen_notify_local", "macros"
 ] }
 hmac-sha256 = { version = "1.1.7", features = ["traits010"] }

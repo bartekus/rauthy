@@ -668,7 +668,7 @@ owner chose one combined release (section 11, "Owner decisions" in
 | Storage dependency | `hiqlite-patched`, `hiqlite-wal-patched`, `hiqlite-derive-patched` `=0.15.0-patched.2`, crates.io |
 | Image | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.3` |
 | Supported topology | N = 1 |
-| Publication status | **not published**. Digests, runs and the tag are recorded here after the publish run, as in section 7 |
+| Publication status | **published 2026-09-24**: release `v0.36.2-patched.3`, image index `sha256:d75cac0f...`. Section 12.6 |
 
 ### 12.2 Dependency graph
 
@@ -731,3 +731,43 @@ macOS arm64 debug, 200 writes, SIGKILL, restart: with the fix, two of three rest
 build did not lose the race in four tries on this host. Leg Q now also asserts that the restart
 does not bootstrap its database. The proper place for the guarantee is Hiqlite's health (or its
 start) not reporting ready before the replay; that is a follow-up there.
+
+### 12.6 Publication
+
+**Published 2026-09-24.** Every value below was read back from GitHub and the registry after the
+publish run, anonymously. The copy of this file attached to the release is the one from the
+tagged tree, written before these values existed; the tag does not move.
+
+| | |
+|---|---|
+| Release | https://github.com/bartekus/rauthy/releases/tag/v0.36.2-patched.3 (id `395689045`, 8 assets) |
+| Tag | `v0.36.2-patched.3` -> `da8fb522a000fcfc44bbb70bd45e3500185de804` (the merge of PR #7) |
+| Reviewed heads | PR #6 at `43187a17` (review `35969388060`), PR #7 at `b1bfe51d` (review `35986292290`), both `VERDICT: no blocking findings` |
+| Image, pinned | `ghcr.io/bartekus/rauthy-patched:0.36.2-patched.3@sha256:d75cac0f708f3e238c458b622fea2f0b7dda9b67e9435eeafa37698d88a2a3c8` |
+| `linux/amd64` manifest | `sha256:63d3213f04db80e65fe243c441f74fbdf50353e2b23464bf1485cb2b2a60015c` |
+| `linux/arm64` manifest | `sha256:aa468fc4fff7b9148452ba2229117e6e73799666a791ad0649ae3176cec26a20` |
+| `rauthy_amd64` sha256 | `809aa9eb97e7f0b331279719a37de9191fd8e66bfc051f84997221c9a303a188` |
+| `rauthy_arm64` sha256 | `d30f38213465acd4db132d3af2d9ba85a68ff9567eaec4c371b0c9b7e23ad257` |
+| `Cargo.lock` sha256 | `9b7ecd05881d78f3fea90962517e75dea1aed1edb36fb040f52c6265b154f99d` |
+| Toolchain | `rust:1.95.0-bookworm` |
+| Candidate run (merge commit) | https://github.com/bartekus/rauthy/actions/runs/35994138356 |
+| Publish run | https://github.com/bartekus/rauthy/actions/runs/36002146726 |
+
+**What each run established.** The merge-commit candidate: first attempt, all 10 jobs green,
+acceptance 259 passed, 0 failed, 0 skipped, strict, natively on amd64 and arm64 (including J-F
+with the fault-point build, leg V from the published `0.36.2-patched.2` image, and leg Q's new
+re-bootstrap assertion); both integration suites; Rahi's live suite. The publish run, first
+attempt, every job green: gate, image push and attestation, native verification per
+architecture, release creation.
+
+The earlier merge-commit candidate for PR #6, `35977264343`, failed on arm64 (F22, 12.5) and was
+not promoted; `0.36.2-patched.3` contains the fix.
+
+**Checked independently afterwards,** without credentials: the tag `0.36.2-patched.3` resolves to
+the index above (an anonymous registry token); each platform's `/app/rauthy`, pulled by digest,
+is byte-identical to the release asset of the same name, which `SHA256SUMS` lists; `--version`
+prints `rauthy 0.36.2-patched.3`; the `0.36.2-patched.2` tag still resolves to
+`sha256:ea114a8b...`. The correction notice for `0.36.2-patched.2` was attached to that release
+the same day as a ninth asset (sha256 `f4ddb22b...`); its other eight assets and tag are
+unchanged.
+

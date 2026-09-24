@@ -569,6 +569,8 @@ fi
 # with Hiqlite's `__upgrade-fault-points` feature, which case J-F needs; it is never an image.
 
 J_EXPECT="${J_EXPECT:-repaired}"
+case "$J_EXPECT" in repaired|published) ;;
+  *) echo "J_EXPECT must be repaired or published, not '$J_EXPECT'" >&2; exit 2 ;; esac
 J_KEY_JSON='{"name":"acceptance","exp":null,"access":[{"group":"Users","access_rights":["read"]},{"group":"Groups","access_rights":["read","create"]},{"group":"Clients","access_rights":["read"]},{"group":"Blacklist","access_rights":["read","create"]}]}'
 J_KEY_B64="$(printf '%s' "$J_KEY_JSON" | base64 | tr -d '\n')"
 J_BAN_IP="192.0.2.77"
@@ -759,7 +761,9 @@ else
   jassert "J-E: keys, users, clients and upstream rows survive" $? "$(j_identity 8099)"
   [ "$(unclean_markers "$JE")" = "0" ]
   jassert "J-E: the upgrade did not rebuild the state machine" $?
-  [ -z "$(j_bans 8099)" ]
+  # The list is read successfully and is empty; a failed read must not pass as "no bans".
+  [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H "Authorization: API-Key ${API_KEY_NAME}\$${API_KEY_SECRET}" \
+    http://127.0.0.1:8099/auth/v1/blacklist)" = "200" ] && [ -z "$(j_bans 8099)" ]
   jassert "J-E: the cache starts empty: the manual IP ban is gone (C-6)" $? "$(j_bans 8099)"
   j_held "$JE/data/logs/lock.hql" && j_held "$JE/data/logs_cache/lock.hql" \
     && j_held "$JE/data/hiqlite-owner.lock"

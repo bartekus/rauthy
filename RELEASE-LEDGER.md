@@ -641,3 +641,12 @@ lock has to be read for that as well, or the check extended.
   between the two, or a backup carrying an earlier run's row, would have let a restored instance
   serve a stale cached session. It now runs by operation id through durable phases. Not
   implemented.
+
+**Independent review of `51e73280..b4adba04`** (local reviewer, 2026-09-24): `VERDICT: no
+blocking findings`. Acted on: J-E's "the ban is gone" could pass on a failed read (it now
+requires a `200`); `J_EXPECT` is validated; the notice now also states Rauthy's own observation
+of upstream over an upgraded directory. Recorded, required before the harness reaches a branch
+CI runs: `release-candidate.yaml` does not build a fault-point binary or set `RAUTHY_FAULT`, so a
+strict run would skip J-F and fail; and leg J's default expectations fail on any build still on
+`0.15.0-patched.1`, so the harness change belongs only with the repin. These fixes follow the
+recorded runs and have not been run.

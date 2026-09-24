@@ -40,8 +40,9 @@ this notice.
    upstream there; everything written after the upgrade is then lost. Starting upstream on a
    directory this release has written is unsupported, with or without moving the cache by hand:
    in Hiqlite's own probes, Hiqlite 0.14 over a cache written by this release's Hiqlite panicked
-   every time and in some runs left Raft metadata torn, and a manual move before the start has
-   not been shown safe.
+   every time and in some runs left Raft metadata torn; in Rauthy's own acceptance, upstream
+   Rauthy over an upgraded directory was still running at 60 s. Neither result makes it safe,
+   and a manual move before the start has not been shown safe either.
 5. **An interrupted first start.** If the first start with the variable ends (crash, kill, out
    of memory, power loss) before `<data_dir>/logs_cache/hiqlite-cache-log-format` exists, start
    nothing on that volume, with or without the variable: the next start can restore an old cache

@@ -17,6 +17,11 @@
 #
 # ACCEPTANCE_STRICT=1 also fails the run on any skipped leg. A publication candidate runs strict,
 # because a leg that could not run is a leg that was not qualified, however it is reported.
+#
+# ACCEPTANCE_STOP_ON_FAIL=1 ends the run at the first failed assertion, keeping its directories.
+# RAUTHY_FAULT names a test build with Hiqlite's `__upgrade-fault-points` feature, for leg J's
+# interruption cases; without it they are skipped. J_EXPECT=published turns leg J into a negative
+# control for a build on the published Hiqlite 0.15.0-patched.1 (see leg J).
 
 set -uo pipefail
 
@@ -46,12 +51,32 @@ declare -a RESULTS=()
 log()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { PASS=$((PASS + 1)); RESULTS+=("PASS  $1"); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); RESULTS+=("FAIL  $1")
-         printf '  \033[31mFAIL\033[0m %s\n    %s\n' "$1" "${2:-}"; }
+         printf '  \033[31mFAIL\033[0m %s\n    %s\n' "$1" "${2:-}";
+         # A bounded local run stops at the first unexpected failure and keeps its directories.
+         if [ "${ACCEPTANCE_STOP_ON_FAIL:-0}" = "1" ]; then finish; fi; }
 skip() { SKIP=$((SKIP + 1)); RESULTS+=("SKIP  $1: ${2:-}")
          printf '  \033[33mSKIP\033[0m %s (%s)\n' "$1" "${2:-}"; }
 
 assert() { # assert <name> <condition-result> <detail>
   if [ "$2" = "0" ]; then ok "$1"; else bad "$1" "${3:-}"; fi
+}
+
+# finish: the summary, the machine-readable result, and the exit code. Also reached from `bad`
+# when ACCEPTANCE_STOP_ON_FAIL=1.
+finish() {
+  log "Summary"
+  printf '%s\n' "${RESULTS[@]}"
+  printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+  # One machine-readable line, so that a publication step can check the result instead of the
+  # exit code of a job that might have been configured to tolerate a failure.
+  printf '{"passed":%d,"failed":%d,"skipped":%d,"strict":%s}\n' "$PASS" "$FAIL" "$SKIP" \
+    "$([ "${ACCEPTANCE_STRICT:-0}" = "1" ] && echo true || echo false)" > "$WORK/acceptance-result.json"
+  [ "$FAIL" -eq 0 ] || exit 1
+  if [ "${ACCEPTANCE_STRICT:-0}" = "1" ] && [ "$SKIP" -ne 0 ]; then
+    echo "strict run: $SKIP leg(s) skipped, which a publication candidate does not allow" >&2
+    exit 1
+  fi
+  exit 0
 }
 
 # --- process helpers ---------------------------------------------------------
@@ -532,105 +557,308 @@ if [ -n "$BACKUP_FILE" ]; then
 fi
 
 # --- J: upgrade from the upstream baseline -----------------------------------
+#
+# Hiqlite 035 (the N=1 upgrade exclusion) against the real upstream v0.36.2 binary. Every case
+# gets its own copy of a data directory the upstream binary wrote, and its own ports where two
+# processes share a directory, so that a refusal is about the storage locks and never about a
+# port. The cases are a fixed list; each runs once.
+#
+# J_EXPECT=published runs the same cases as a negative control against a build on the published
+# Hiqlite 0.15.0-patched.1: each `jcontrol` assertion is one that build is known to fail, and
+# must fail; every other case assertion is recorded, not counted. RAUTHY_FAULT names a test build
+# with Hiqlite's `__upgrade-fault-points` feature, which case J-F needs; it is never an image.
 
-log "J. Upgrade from the upstream baseline"
+J_EXPECT="${J_EXPECT:-repaired}"
+J_KEY_JSON='{"name":"acceptance","exp":null,"access":[{"group":"Users","access_rights":["read"]},{"group":"Groups","access_rights":["read","create"]},{"group":"Clients","access_rights":["read"]},{"group":"Blacklist","access_rights":["read","create"]}]}'
+J_KEY_B64="$(printf '%s' "$J_KEY_JSON" | base64 | tr -d '\n')"
+J_BAN_IP="192.0.2.77"
+
+record() { RESULTS+=("RECORD $1: $2"); printf '  \033[36mRECORD\033[0m %s: %s\n' "$1" "$2"; }
+
+# jassert: a case assertion. Asserted for the repaired build, recorded for the published one.
+jassert() {
+  if [ "$J_EXPECT" = "published" ]; then
+    record "$1" "$([ "$2" = "0" ] && echo holds || echo "does not hold") on the published build"
+  else
+    assert "$@"
+  fi
+}
+
+# jcontrol: an assertion the published build is known to fail. For it, the failure is the pass.
+jcontrol() {
+  if [ "$J_EXPECT" = "published" ]; then
+    if [ "$2" != "0" ]; then ok "negative control fails on the published build: $1"
+    else bad "negative control did not fail on the published build: $1" "${3:-}"; fi
+  else
+    assert "$@"
+  fi
+}
+
+j_get() { curl -s -m 10 -H "Authorization: API-Key ${API_KEY_NAME}\$${API_KEY_SECRET}" \
+  "http://127.0.0.1:$1/auth/v1/$2"; }
+j_users()   { j_get "$1" users   | grep -o '"email":"[^"]*"' | sort -u | tr '\n' ' '; }
+j_clients() { j_get "$1" clients | grep -o '"id":"[^"]*"'    | sort -u | tr '\n' ' '; }
+j_groups()  { j_get "$1" groups  | grep -o '"name":"[^"]*"'  | sort -u | tr '\n' ' '; }
+j_bans()    { j_get "$1" blacklist | grep -o '"ip":"[^"]*"'  | sort -u | tr '\n' ' '; }
+# What must survive an upgrade: signing keys, users, clients, and rows written by upstream.
+j_identity() { printf 'kid=%s|users=%s|clients=%s' "$(jwks_kid "$1")" "$(j_users "$1")" \
+  "$(j_clients "$1")"; }
+j_ban() {
+  curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST \
+    -H "Authorization: API-Key ${API_KEY_NAME}\$${API_KEY_SECRET}" -H 'Content-Type: application/json' \
+    -d "{\"ip\":\"$J_BAN_IP\",\"exp\":$(( $(date +%s) + 86400 ))}" "http://127.0.0.1:$1/auth/v1/blacklist"
+}
+j_inode() { ls -di "$1" 2>/dev/null | awk '{print $1}'; }
+# A lock file is held when it exists and a non-blocking flock on it fails. Existence first,
+# because flock(1) creates a missing file.
+j_held() { [ -e "$1" ] && ! flock -n "$1" true; }
+j_pre_upgrade() { find "$1" -maxdepth 1 -type d -name 'pre-upgrade-*' | sort; }
+# j_case <name> <gold>: a fresh case directory holding a copy of a gold data directory.
+j_case() {
+  local d="$WORK/j-$1"; rm -rf "$d"; mkdir -p "$d"; cp "$CONFIG_TEMPLATE" "$d/config.toml"
+  cp -a "$2" "$d/data"; echo "$d"
+}
+# The one-upgrade-start state a case ends in: exactly one final pre-upgrade directory, nothing
+# partial or staged, and the legacy cache in it byte-identical to what upstream left.
+j_moved_once() {
+  local data="$1" gold="$2" moved
+  moved="$(j_pre_upgrade "$data")"
+  [ "$(printf '%s\n' "$moved" | grep -c .)" = "1" ] || return 1
+  case "$moved" in *.partial) return 1 ;; esac
+  [ ! -e "$data/logs_cache.hiqlite-next" ] || return 1
+  diff -r -x lock.hql "$gold/logs_cache" "$moved/logs_cache" > /dev/null || return 1
+  diff -r "$gold/state_machine_cache" "$moved/state_machine_cache" > /dev/null || return 1
+  [ "$(cat "$data/logs_cache/hiqlite-cache-log-format" 2>/dev/null)" = "2" ]
+}
+JP="8099 8109 8209"   # the ports the directory's own node uses
+JQ="8098 8108 8208"   # a second process on the same directory
+JENV=(BOOTSTRAP_API_KEY="$J_KEY_B64")
+
+log "J. Upgrade from the upstream baseline (expecting: $J_EXPECT)"
 if [ -z "$UPSTREAM" ]; then
   skip "upgrade from the upstream baseline" "no upstream binary given"
   skip "rollback to the upstream baseline" "no upstream binary given"
 else
-  J="$WORK/j-upgrade"
-  BIN="$UPSTREAM" start_node "$J" 8099 8109 8209
-  wait_ready "$J" 8099 300
-  assert "the upstream baseline boots and populates a data directory" $? "see $J/rauthy.log"
-  KID_UP="$(jwks_kid 8099)"
-  [ "$(create_group 8099 acceptance_written_by_upstream)" = "200" ]
-  assert "the upstream baseline accepts a write" $?
-  stop_node "$J"
-  sleep 3
-  cp -a "$J/data" "$J/data-as-upstream-left-it"
+  # Gold: a directory upstream v0.36.2 initialized, wrote to, banned an address in, and stopped
+  # cleanly. Every case copies it; nothing runs on it.
+  JG="$WORK/j-gold"; rm -rf "$JG"
+  BIN="$UPSTREAM" start_node "$JG" $JP "${JENV[@]}"
+  wait_ready "$JG" 8099 120
+  assert "J: the upstream baseline boots and populates a data directory" $? "see $JG/rauthy.log"
+  [ "$(create_group 8099 j_written_by_upstream)" = "200" ]
+  assert "J: the upstream baseline accepts a write" $?
+  [ "$(j_ban 8099)" = "200" ] && [ -n "$(j_bans 8099)" ]
+  assert "J: the upstream baseline holds a manual IP ban (cache-only state)" $? "$(j_bans 8099)"
+  J_ID_UP="$(j_identity 8099)"
+  [ -n "$(jwks_kid 8099)" ] && [ -n "$(j_users 8099)" ] && [ -n "$(j_clients 8099)" ]
+  assert "J: keys, users and clients are readable for comparison" $? "$J_ID_UP"
+  stop_node "$JG"
+  [ "$(cat "$JG/rc" 2>/dev/null)" = "0" ]
+  assert "J: the upstream baseline stops cleanly" $? "exit $(cat "$JG/rc" 2>/dev/null)"
+  J_GOLD="$WORK/j-gold-data"; rm -rf "$J_GOLD"; cp -a "$JG/data" "$J_GOLD"
 
-  # The cache raft's log format changed after hiqlite 0.14.0 and is not readable across the
-  # upgrade; the SQLite database and its raft log are. Started on the directory as upstream left
-  # it, the patched build must refuse with an error that names the procedure, not abort, and must
-  # leave the directory as it found it.
-  mv "$J/rauthy.log" "$J/upstream-run.log"
-  run_until_exit "$J" 8099 8109 8209 180
-  RC=$?
+  # Gold, killed: the same directory, one more acknowledged write, then SIGKILL, which leaves
+  # the WAL lock files and `state_machine/lock`.
+  JK="$(j_case gold-killed-run "$J_GOLD")"
+  BIN="$UPSTREAM" start_node "$JK" $JP "${JENV[@]}"
+  wait_ready "$JK" 8099 60
+  assert "J: the upstream baseline restarts on its own directory" $? "see $JK/rauthy.log"
+  [ "$(create_group 8099 j_written_before_the_kill)" = "200" ]
+  assert "J: the upstream baseline acknowledges a write before the kill" $?
+  kill -KILL "$(cat "$JK/pid")"; sleep 2; rm -f "$JK/pid"
+  [ -e "$JK/data/state_machine/lock" ]
+  assert "J: the killed upstream node left its unclean-stop marker" $? "$(ls "$JK/data/state_machine")"
+  J_GOLD_KILLED="$WORK/j-gold-killed-data"; rm -rf "$J_GOLD_KILLED"; cp -a "$JK/data" "$J_GOLD_KILLED"
+
+  # J-A. No consent: a refusal that says what it created, and nothing else changed.
+  log "J-A. Upgrade without consent"
+  JA="$(j_case a "$J_GOLD")"
+  run_until_exit "$JA" $JP 60 "${JENV[@]}"; RC=$?
   [ "$RC" -ne 0 ] && [ "$RC" -ne 134 ] && [ "$RC" -ne 124 ]
-  assert "an upgrade without the cache procedure is refused, not aborted" $? "exit code was $RC"
-  grep -q "logs_cache" "$J/rauthy.log" && grep -q "HQL_CACHE_LEGACY_MOVE_ASIDE=true" "$J/rauthy.log" \
-    && grep -q "Nothing was changed" "$J/rauthy.log"
-  assert "the refusal names the cache log, the opt-in, and that nothing changed" $? \
-    "$(tail -3 "$J/rauthy.log")"
-  # Byte for byte, apart from the ownership lock the refusing process takes first. An earlier
-  # Hiqlite candidate refused only after opening the database, which checkpointed its WAL; this
-  # is the assertion that caught it.
-  diff -r -x hiqlite-owner.lock "$J/data" "$J/data-as-upstream-left-it" > /dev/null
-  assert "the refused upgrade left every file byte-identical" $? \
-    "$(diff -rq -x hiqlite-owner.lock "$J/data" "$J/data-as-upstream-left-it" | head -5)"
-  diff -r "$J/data/logs" "$J/data-as-upstream-left-it/logs" > /dev/null
-  assert "the refused upgrade left the database's raft log byte-identical" $?
-  python3 - "$J/data-as-upstream-left-it/state_machine/db/hiqlite.db" \
-    "$J/data/state_machine/db/hiqlite.db" <<'PYEOF'
-import shutil, sqlite3, sys, tempfile
-def dump(path):
-    # Work on a copy, so that reading it cannot change the evidence either.
-    d = tempfile.mkdtemp()
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            shutil.copy(path + suffix, f"{d}/db{suffix}")
-        except FileNotFoundError:
-            pass
-    return [l for l in sqlite3.connect(f"{d}/db").iterdump() if "sqlite_stat1" not in l]
-sys.exit(0 if dump(sys.argv[1]) == dump(sys.argv[2]) else 1)
-PYEOF
-  assert "the refused upgrade left the database's content unchanged" $?
+  jassert "J-A: an upgrade without consent is refused, not aborted" $? "exit code was $RC"
+  grep -q "logs_cache" "$JA/rauthy.log" && grep -q "HQL_CACHE_LEGACY_MOVE_ASIDE=true" "$JA/rauthy.log"
+  jassert "J-A: the refusal names the cache log and the consent variable" $? "$(tail -3 "$JA/rauthy.log")"
+  ! grep -q "Nothing was changed" "$JA/rauthy.log" \
+    && grep -q "this start created .*hiqlite-owner.lock" "$JA/rauthy.log"
+  jcontrol "J-A: the refusal names the owner lock it created instead of claiming nothing changed" $? \
+    "$(grep -o 'Nothing was changed.*\|No data was changed.*' "$JA/rauthy.log" | head -1)"
+  diff -r -x hiqlite-owner.lock "$JA/data" "$J_GOLD" > /dev/null
+  jassert "J-A: apart from the owner lock, every file is byte-identical" $? \
+    "$(diff -rq -x hiqlite-owner.lock "$JA/data" "$J_GOLD" | head -5)"
 
-  # The procedure, through Hiqlite's supported opt-in for the one upgrade start: it moves the
-  # cache raft's log and snapshots into pre-upgrade-<unix seconds>/ and deletes nothing.
-  mv "$J/rauthy.log" "$J/refused-upgrade.log"
-  start_node "$J" 8099 8109 8209 HQL_CACHE_LEGACY_MOVE_ASIDE=true
-  wait_ready "$J" 8099 300
-  assert "the patched build starts on the upstream data directory" $? "see $J/rauthy.log"
-  MOVED="$(find "$J/data" -maxdepth 1 -type d -name 'pre-upgrade-*' | head -1)"
-  [ -n "$MOVED" ] && [ -d "$MOVED/logs_cache" ] && [ -d "$MOVED/state_machine_cache" ]
-  assert "the legacy cache was moved aside, not deleted" $? "$(ls "$J/data")"
-  [ "$(jwks_kid 8099)" = "$KID_UP" ]
-  assert "the upgrade keeps the signing key" $? "before: $KID_UP after: $(jwks_kid 8099)"
-  [ "$(unclean_markers "$J")" = "0" ]
-  assert "the upgrade did not have to rebuild the state machine" $?
-  [ -n "$(admin_identity 8099)" ]
-  assert "the upgraded instance keeps the original identity" $? \
-    "no $ADMIN_EMAIL after the upgrade"
-  group_exists 8099 acceptance_written_by_upstream
-  assert "data written by the upstream baseline survives the upgrade" $?
-  [ "$(create_group 8099 acceptance_written_by_patched)" = "200" ]
-  assert "the upgraded instance accepts writes" $?
-  stop_node "$J"
-  sleep 3
-  # The opt-in is for one start. Every later start runs without it.
-  mv "$J/rauthy.log" "$J/upgrade-run.log"
-  start_node "$J" 8099 8109 8209
-  wait_ready "$J" 8099 300
-  assert "the upgraded node restarts without the opt-in" $? "see $J/rauthy.log"
-  stop_node "$J"
-  sleep 3
+  # J-B and J-C. A live upstream node on the directory. The candidate is refused before any
+  # rename, with and without consent, and the upstream node goes on, stops cleanly, restarts.
+  for jc in B C; do
+    # Without consent the published build also refuses and renames nothing; only which lock it
+    # names tells the two apart there.
+    if [ "$jc" = "B" ]; then JCON=(HQL_CACHE_LEGACY_MOVE_ASIDE=true); jw="with"; jb=jcontrol
+    else JCON=(); jw="without"; jb=jassert; fi
+    log "J-$jc. A live upstream node, candidate $jw consent"
+    JL="$(j_case "$jc-live" "$J_GOLD")"
+    BIN="$UPSTREAM" start_node "$JL" $JP "${JENV[@]}"
+    wait_ready "$JL" 8099 60
+    assert "J-$jc: the upstream node serves the directory" $? "see $JL/rauthy.log"
+    INODE_BEFORE="$(j_inode "$JL/data/logs_cache")"
+    JS="$WORK/j-$jc-second"; rm -rf "$JS"; mkdir -p "$JS"; cp "$CONFIG_TEMPLATE" "$JS/config.toml"
+    run_until_exit "$JS" $JQ 60 "${JENV[@]}" HQL_DATA_DIR="$JL/data" "${JCON[@]}"; RC=$?
+    [ "$RC" -ne 0 ] && [ "$RC" -ne 134 ] && [ "$RC" -ne 124 ]
+    $jb "J-$jc: the candidate is refused, not aborted" $? "exit code was $RC"
+    grep -q "lock.hql is locked by another live process" "$JS/rauthy.log"
+    jcontrol "J-$jc: the refusal is the live node's WAL lock" $? "$(tail -3 "$JS/rauthy.log")"
+    [ -z "$(j_pre_upgrade "$JL/data")" ] && [ "$(j_inode "$JL/data/logs_cache")" = "$INODE_BEFORE" ]
+    $jb "J-$jc: nothing was renamed under the live node" $? \
+      "pre-upgrade: $(j_pre_upgrade "$JL/data") inode $INODE_BEFORE -> $(j_inode "$JL/data/logs_cache")"
+    [ "$(create_group 8099 "j_written_after_refusal_$jc")" = "200" ]
+    jassert "J-$jc: the upstream node still accepts writes" $?
+    stop_node "$JL"
+    [ "$(cat "$JL/rc" 2>/dev/null)" = "0" ]
+    jassert "J-$jc: the upstream node stops cleanly" $? "exit $(cat "$JL/rc" 2>/dev/null)"
+    mv "$JL/rauthy.log" "$JL/upstream-first.log"
+    BIN="$UPSTREAM" start_node "$JL" $JP "${JENV[@]}"
+    wait_ready "$JL" 8099 60
+    jassert "J-$jc: the upstream node restarts" $? "see $JL/rauthy.log"
+    group_exists 8099 j_written_by_upstream && group_exists 8099 "j_written_after_refusal_$jc"
+    jassert "J-$jc: the restarted upstream node has every row" $?
+    # A plain restart of the same version keeps the disk-backed cache (correction C-6).
+    [ -n "$(j_bans 8099)" ]
+    jassert "J-$jc: a plain upstream restart keeps the manual IP ban" $? "$(j_bans 8099)"
+    stop_node "$JL"
+  done
 
-  # Rollback: the same procedure in the other direction, because upstream has no way to refuse a
-  # cache log it cannot read. The version this build stamps into the config table must not lock
-  # upstream out, and what the patched build wrote must be readable by upstream.
-  mv "$J/rauthy.log" "$J/patched-run.log"
-  mkdir -p "$J/data/pre-rollback"
-  mv "$J/data/logs_cache" "$J/data/state_machine_cache" "$J/data/pre-rollback/"
-  BIN="$UPSTREAM" start_node "$J" 8099 8109 8209
-  wait_ready "$J" 8099 300
-  assert "the upstream baseline still starts after the upgrade" $? \
-    "rollback is blocked: $(tail -5 "$J/rauthy.log")"
-  [ "$(jwks_kid 8099)" = "$KID_UP" ]
-  assert "the rollback keeps the signing key" $?
-  group_exists 8099 acceptance_written_by_patched
-  assert "data written by the patched build survives the rollback" $?
-  stop_node "$J"
+  # J-D. Upstream was killed. Rauthy builds Hiqlite with `auto-heal`, so the unclean-stop marker
+  # is the rebuild policy, not a refusal: the move and the rebuild run under the held locks.
+  log "J-D. A killed upstream node, candidate with consent (auto-heal)"
+  JD="$(j_case d "$J_GOLD_KILLED")"
+  start_node "$JD" $JP "${JENV[@]}" HQL_CACHE_LEGACY_MOVE_ASIDE=true
+  wait_ready "$JD" 8099 90
+  jassert "J-D: the candidate starts over the killed node's directory" $? "$(tail -3 "$JD/rauthy.log")"
+  j_moved_once "$JD/data" "$J_GOLD_KILLED"
+  jassert "J-D: the move completed once, the legacy cache byte-identical" $? "$(ls "$JD/data")"
+  [ "$(j_identity 8099)" = "$J_ID_UP" ] && group_exists 8099 j_written_by_upstream \
+    && group_exists 8099 j_written_before_the_kill
+  jassert "J-D: keys, users, clients and every acknowledged row survive the rebuild" $? \
+    "$(j_identity 8099)"
+  record "J-D: unclean-stop messages in the candidate's log" "$(unclean_markers "$JD")"
+  j_held "$JD/data/logs/lock.hql" && j_held "$JD/data/logs_cache/lock.hql" \
+    && j_held "$JD/data/hiqlite-owner.lock"
+  jassert "J-D: the owner lock and both WAL locks are held while it serves" $?
+  stop_node "$JD"
+  [ "$(cat "$JD/rc" 2>/dev/null)" = "0" ]
+  jassert "J-D: the rebuilt node stops cleanly" $? "exit $(cat "$JD/rc" 2>/dev/null)"
+
+  # J-E. The upgrade itself, as the handoff states it, with the archive an operator takes first.
+  log "J-E. The consent upgrade"
+  JE="$(j_case e "$J_GOLD")"
+  cp -a "$JE/data" "$JE/archive-before-upgrade"
+  start_node "$JE" $JP "${JENV[@]}" HQL_CACHE_LEGACY_MOVE_ASIDE=true
+  wait_ready "$JE" 8099 90
+  jassert "J-E: the candidate starts with consent" $? "$(tail -3 "$JE/rauthy.log")"
+  j_moved_once "$JE/data" "$J_GOLD"
+  jassert "J-E: the move completed once, the legacy cache byte-identical" $? "$(ls "$JE/data")"
+  [ "$(j_identity 8099)" = "$J_ID_UP" ] && group_exists 8099 j_written_by_upstream
+  jassert "J-E: keys, users, clients and upstream rows survive" $? "$(j_identity 8099)"
+  [ "$(unclean_markers "$JE")" = "0" ]
+  jassert "J-E: the upgrade did not rebuild the state machine" $?
+  [ -z "$(j_bans 8099)" ]
+  jassert "J-E: the cache starts empty: the manual IP ban is gone (C-6)" $? "$(j_bans 8099)"
+  j_held "$JE/data/logs/lock.hql" && j_held "$JE/data/logs_cache/lock.hql" \
+    && j_held "$JE/data/hiqlite-owner.lock"
+  jassert "J-E: the owner lock and both WAL locks are held while it serves" $?
+  [ "$(create_group 8099 j_written_by_the_candidate)" = "200" ]
+  jassert "J-E: the upgraded node accepts writes" $?
+  stop_node "$JE"
+  [ "$(cat "$JE/rc" 2>/dev/null)" = "0" ] && [ ! -e "$JE/data/logs/lock.hql" ] \
+    && [ ! -e "$JE/data/logs_cache/lock.hql" ]
+  jassert "J-E: a clean stop removes both WAL lock files" $? "exit $(cat "$JE/rc" 2>/dev/null)"
+  mv "$JE/rauthy.log" "$JE/upgrade-run.log"
+  start_node "$JE" $JP "${JENV[@]}"
+  wait_ready "$JE" 8099 60
+  jassert "J-E: the upgraded node restarts without consent" $? "see $JE/rauthy.log"
+  group_exists 8099 j_written_by_the_candidate && [ "$(unclean_markers "$JE")" = "0" ]
+  jassert "J-E: the restart is clean and keeps the candidate's row" $?
+  stop_node "$JE"
+
+  # J-F. The candidate killed at each of Hiqlite's documented fault points (035 B-5).
+  log "J-F. Interrupted consent moves"
+  if [ "$J_EXPECT" = "published" ]; then
+    record "J-F" "not applicable: the published build has no fault points (J-G is its control)"
+  elif [ -z "${RAUTHY_FAULT:-}" ]; then
+    skip "J-F: interrupted consent moves" "no RAUTHY_FAULT build given"
+  else
+    for point in after-db-lock after-cache-lock after-partial-created after-snapshots-moved \
+                 after-staged after-legacy-log-moved after-log-moved; do
+      JF="$(j_case "f-$point" "$J_GOLD")"
+      BIN="$RAUTHY_FAULT" run_until_exit "$JF" $JP 60 "${JENV[@]}" \
+        HQL_CACHE_LEGACY_MOVE_ASIDE=true HQL_TEST_UPGRADE_FAULT="$point"; RC=$?
+      [ "$RC" = "134" ] && grep -q "HQL_TEST_UPGRADE_FAULT: aborting at $point" "$JF/rauthy.log"
+      assert "J-F $point: the fault build aborted at that point" $? "exit $RC"
+      mv "$JF/rauthy.log" "$JF/fault.log"
+      run_until_exit "$JF" $JP 60 "${JENV[@]}"; RC=$?
+      [ "$RC" -ne 0 ] && [ "$RC" -ne 134 ] && [ "$RC" -ne 124 ] \
+        && grep -q "HQL_CACHE_LEGACY_MOVE_ASIDE=true" "$JF/rauthy.log"
+      assert "J-F $point: the next start without consent is refused, naming it" $? \
+        "exit $RC: $(tail -2 "$JF/rauthy.log")"
+      mv "$JF/rauthy.log" "$JF/refused.log"
+      start_node "$JF" $JP "${JENV[@]}" HQL_CACHE_LEGACY_MOVE_ASIDE=true
+      wait_ready "$JF" 8099 90
+      assert "J-F $point: the next start with consent completes" $? "$(tail -3 "$JF/rauthy.log")"
+      j_moved_once "$JF/data" "$J_GOLD"
+      assert "J-F $point: one operation, legacy cache byte-identical, nothing staged" $? \
+        "$(ls "$JF/data")"
+      [ "$(j_identity 8099)" = "$J_ID_UP" ] && group_exists 8099 j_written_by_upstream
+      assert "J-F $point: keys, users, clients and rows survive" $? "$(j_identity 8099)"
+      stop_node "$JF"
+      [ "$(cat "$JF/rc" 2>/dev/null)" = "0" ]
+      assert "J-F $point: the resumed node stops cleanly" $? "exit $(cat "$JF/rc" 2>/dev/null)"
+    done
+  fi
+
+  # J-G. What the published build leaves after a crash between its two renames: the legacy log
+  # moved, the 0.14 snapshots still in place, no format marker (Hiqlite F-130). Constructed.
+  log "J-G. The published build's interrupted move"
+  JGS="$(j_case g "$J_GOLD")"
+  mkdir "$JGS/data/pre-upgrade-1700000000"
+  mv "$JGS/data/logs_cache" "$JGS/data/pre-upgrade-1700000000/"
+  run_until_exit "$JGS" $JP 60 "${JENV[@]}"; RC=$?
+  [ "$RC" -ne 0 ] && [ "$RC" -ne 134 ] && [ "$RC" -ne 124 ] \
+    && grep -q "interrupted between its two renames" "$JGS/rauthy.log"
+  jcontrol "J-G: without consent the start is refused, not the 0.14 snapshot restored" $? \
+    "exit $RC: $(tail -2 "$JGS/rauthy.log")"
+  mv "$JGS/rauthy.log" "$JGS/refused.log"
+  start_node "$JGS" $JP "${JENV[@]}" HQL_CACHE_LEGACY_MOVE_ASIDE=true
+  wait_ready "$JGS" 8099 90
+  jassert "J-G: with consent the start finishes the move" $? "$(tail -3 "$JGS/rauthy.log")"
+  j_moved_once "$JGS/data" "$J_GOLD"
+  jassert "J-G: the snapshots joined the log in the one directory, byte-identical" $? \
+    "$(ls "$JGS/data" "$JGS/data/pre-upgrade-1700000000")"
+  [ "$(j_identity 8099)" = "$J_ID_UP" ] && group_exists 8099 j_written_by_upstream
+  jassert "J-G: keys, users, clients and rows survive" $? "$(j_identity 8099)"
+  stop_node "$JGS"
+
+  # J-H. The supported way back (C-4): the archive taken before the upgrade, restored into a
+  # fresh volume, started by upstream. What was written after the upgrade is lost, as stated.
+  log "J-H. Rollback from the pre-upgrade archive into a fresh volume"
+  JH="$(j_case h "$JE/archive-before-upgrade")"
+  BIN="$UPSTREAM" start_node "$JH" $JP "${JENV[@]}"
+  wait_ready "$JH" 8099 60
+  jassert "J-H: upstream starts from the restored archive" $? "$(tail -3 "$JH/rauthy.log")"
+  [ "$(j_identity 8099)" = "$J_ID_UP" ] && group_exists 8099 j_written_by_upstream \
+    && ! group_exists 8099 j_written_by_the_candidate
+  jassert "J-H: the archive's state, without what the upgraded node wrote" $? "$(j_groups 8099)"
+  stop_node "$JH"
+  [ "$(cat "$JH/rc" 2>/dev/null)" = "0" ]
+  jassert "J-H: upstream stops cleanly" $? "exit $(cat "$JH/rc" 2>/dev/null)"
+
+  # J-I. Upstream started over the upgraded directory. Unsupported (C-4, Hiqlite B-4): recorded,
+  # never passed or failed. It runs on its own copy, so nothing above depends on it.
+  log "J-I. Upstream over the upgraded directory (recorded, unsupported)"
+  JI="$(j_case i "$JE/data")"
+  BIN="$UPSTREAM" run_until_exit "$JI" $JP 60 "${JENV[@]}"; RC=$?
+  record "J-I: upstream exit code over an upgraded directory" "$RC (124 = still running at 60 s)"
+  record "J-I: its last log line" "$(tail -1 "$JI/rauthy.log" | cut -c1-200)"
+  record "J-I: meta.hql sizes afterwards (logs, logs_cache)" \
+    "$(wc -c < "$JI/data/logs/meta.hql" 2>/dev/null | tr -d ' '), $(wc -c < "$JI/data/logs_cache/meta.hql" 2>/dev/null | tr -d ' ')"
+  record "J-I: state_machine/lock left behind" "$([ -e "$JI/data/state_machine/lock" ] && echo yes || echo no)"
 fi
 
 # --- M: TLS is an exit path too -----------------------------------------------
@@ -1182,15 +1410,4 @@ fi
 
 # --- summary -----------------------------------------------------------------
 
-log "Summary"
-printf '%s\n' "${RESULTS[@]}"
-printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
-# One machine-readable line, so that a publication step can check the result instead of the
-# exit code of a job that might have been configured to tolerate a failure.
-printf '{"passed":%d,"failed":%d,"skipped":%d,"strict":%s}\n' "$PASS" "$FAIL" "$SKIP" \
-  "$([ "${ACCEPTANCE_STRICT:-0}" = "1" ] && echo true || echo false)" > "$WORK/acceptance-result.json"
-[ "$FAIL" -eq 0 ] || exit 1
-if [ "${ACCEPTANCE_STRICT:-0}" = "1" ] && [ "$SKIP" -ne 0 ]; then
-  echo "strict run: $SKIP leg(s) skipped, which a publication candidate does not allow" >&2
-  exit 1
-fi
+finish

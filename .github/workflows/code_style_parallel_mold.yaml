@@ -34,6 +34,8 @@ jobs:
                   just build-wasm
                   cd frontend
                   npm install
+                  # svelte-check needs the generated .svelte-kit/tsconfig.json
+                  npx svelte-kit sync
             - name: Code Format UI
               working-directory: ./frontend
               run: npm run format-check
@@ -82,3 +84,5 @@ jobs:
                   just build-ui
             - name: Integration Tests against Hiqlite
               run: just test-hiqlite
+            - name: Linker used
+              run: readelf -p .comment target/debug/rauthy | grep -iE 'mold|GNU ld|LLD' || echo "no linker tag"

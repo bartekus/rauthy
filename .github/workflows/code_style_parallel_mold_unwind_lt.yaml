@@ -1,4 +1,4 @@
-name: Code Style (parallel, mold, line-tables-only)
+name: Code Style (parallel, mold, unwind, line-tables-only)
 
 on:
     pull_request:
@@ -19,6 +19,9 @@ env:
     CARGO_TERM_COLOR: 'always'
     # The image has mold in /work/.cargo/config.toml, which CI never reads: it checks out to /__w/.
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    # Tests always build with panic=unwind, so with panic=abort in the dev profile the whole
+    # dependency tree compiles twice: once for `cargo build`, once for `cargo test`.
+    CARGO_PROFILE_DEV_PANIC: unwind
     # Full debuginfo only makes the test binaries bigger and slower to link; backtraces keep line numbers.
     CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
@@ -36,6 +39,8 @@ jobs:
                   just build-wasm
                   cd frontend
                   npm install
+                  # svelte-check needs the generated .svelte-kit/tsconfig.json
+                  npx svelte-kit sync
             - name: Code Format UI
               working-directory: ./frontend
               run: npm run format-check
@@ -84,3 +89,5 @@ jobs:
                   just build-ui
             - name: Integration Tests against Hiqlite
               run: just test-hiqlite
+            - name: Linker used
+              run: readelf -p .comment target/debug/rauthy | grep -iE 'mold|GNU ld|LLD' || echo "no linker tag"

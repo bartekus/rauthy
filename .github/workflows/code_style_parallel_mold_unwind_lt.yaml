@@ -1,0 +1,93 @@
+name: Code Style (parallel, mold, unwind, line-tables-only)
+
+on:
+    pull_request:
+        types:
+            - opened
+            - reopened
+            - synchronize
+            - ready_for_review
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: 'always'
+    # The image has mold in /work/.cargo/config.toml, which CI never reads: it checks out to /__w/.
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    # Tests always build with panic=unwind, so with panic=abort in the dev profile the whole
+    # dependency tree compiles twice: once for `cargo build`, once for `cargo test`.
+    CARGO_PROFILE_DEV_PANIC: unwind
+    # Full debuginfo only makes the test binaries bigger and slower to link; backtraces keep line numbers.
+    CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+    ui:
+        if: github.event.pull_request.draft == false
+        name: UI
+        runs-on: ubuntu-latest
+        container:
+            image: ghcr.io/sebadob/rauthy-builder:20261123
+        steps:
+            - uses: actions/checkout@v4
+            - name: Setup UI
+              run: |
+                  just build-wasm
+                  cd frontend
+                  npm install
+                  # svelte-check needs the generated .svelte-kit/tsconfig.json
+                  npx svelte-kit sync
+            - name: Code Format UI
+              working-directory: ./frontend
+              run: npm run format-check
+            - name: Code Style UI
+              working-directory: ./frontend
+              run: npm run check
+            - name: Frontend Contract Tests
+              working-directory: ./frontend
+              run: npm run test:webauthn && npm run test:webauthn-reg
+
+    clippy:
+        if: github.event.pull_request.draft == false
+        name: Backend Format + Clippy
+        runs-on: ubuntu-latest
+        container:
+            image: ghcr.io/sebadob/rauthy-builder:20261123
+        steps:
+            - uses: actions/checkout@v4
+            - name: Code Format Backend
+              run: cargo fmt --check
+            # The backend embeds `static/v1` and the HTML templates, so it needs the built UI.
+            - name: Setup && build UI
+              run: |
+                  just build-wasm
+                  cd frontend
+                  npm install
+                  cd ..
+                  just build-ui
+            - name: Code Style Backend
+              run: cargo clippy --all-targets
+
+    test:
+        if: github.event.pull_request.draft == false
+        name: Integration Tests against Hiqlite
+        runs-on: ubuntu-latest
+        container:
+            image: ghcr.io/sebadob/rauthy-builder:20261123
+        steps:
+            - uses: actions/checkout@v4
+            - name: Setup && build UI
+              run: |
+                  just build-wasm
+                  cd frontend
+                  npm install
+                  cd ..
+                  just build-ui
+            - name: Integration Tests against Hiqlite
+              run: just test-hiqlite
+            - name: Linker used
+              run: readelf -p .comment target/debug/rauthy | grep -iE 'mold|GNU ld|LLD' || echo "no linker tag"
